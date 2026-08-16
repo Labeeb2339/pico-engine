@@ -198,26 +198,27 @@ class Transformer:
 
     @staticmethod
     def _gemv(entry, x, bias=None, residual=None):
-        """Blocked CPU GEMV against a quantized 2D weight.
+        """Vectorized CPU GEMV against a quantized 2D weight.
 
-        entry = (tag, q, s1, s2): q int8 (N, K), s1/s2 fp32 scales. Dequantizes
-        one block at a time so the full fp32 weight is never materialized.
+        entry = (tag, q, s1, s2): q int8 (N, K), s1/s2 fp32 scales. Reshapes q to
+        (N, nb, block) and reduces the block axis in one vectorized op — no Python
+        per-block loop, no full-fp32 materialization beyond one transient (N, nb, block).
         """
         tag, q, s1, s2 = entry
         x = x.float()
         N, K = q.shape
         block = 16 if tag == "q6" else 32
         nb = K // block
-        acc = torch.zeros(N, dtype=torch.float32)
-        for b in range(nb):
-            qb = q[:, b * block:(b + 1) * block].float()
-            xb = x[b * block:(b + 1) * block]
-            if tag == "q4":
-                acc += s1[:, b] * (qb @ xb) - s2[:, b] * xb.sum()
-            elif tag == "q5":
-                acc += s1[:, b] * (qb @ xb - 16.0 * xb.sum())
-            else:  # q6 / q8
-                acc += s1[:, b] * (qb @ xb)
+        q3 = q.float().reshape(N, nb, block)
+        x3 = x.reshape(nb, block)
+        dot = (q3 * x3).sum(-1)          # (N, nb)
+        xs = x3.sum(-1)                  # (nb,)
+        if tag == "q4":
+            acc = (s1 * dot - s2 * xs).sum(-1)
+        elif tag == "q5":
+            acc = (s1 * (dot - 16.0 * xs)).sum(-1)
+        else:  # q6 / q8
+            acc = (s1 * dot).sum(-1)
         if bias is not None:
             acc = acc + bias
         if residual is not None:
