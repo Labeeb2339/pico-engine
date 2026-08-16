@@ -180,6 +180,25 @@ The one real gotcha, found the hard way: **the GGUF `ssm_a` tensor stores
 it again and got coherent-but-garbage output. The fix is to use `ssm_a` as `A`
 directly.
 
+### Parallel selective scan
+
+The SSM recurrence `h_t = a_t·h_{t-1} + b_t` is a first-order linear recurrence,
+so it admits an associative combine `(a1,b1)·(a2,b2) = (a1·a2, a2·b1 + b2)`.
+That turns the O(L) token-by-token loop into a **parallel associative scan**
+(`tl.associative_scan`), the SSM analogue of FlashAttention. The prefill now
+runs all matmuls batched plus one scan per layer instead of L sequential steps:
+
+| prefill tokens | sequential | parallel | speedup |
+|---------------|-----------|----------|---------|
+| 32 | 890 ms | 438 ms | 2.0× |
+| 128 | 2.73 s | 427 ms | 6.4× |
+| 512 | 11.6 s | 1.09 s | **10.7×** |
+| 1024 | 24.2 s | 2.26 s | **10.7×** |
+
+Verified against the sequential path (logits within 5e-5, argmax and the
+carry-over conv/SSM states exact). The kernel fuses the scan, the C·h output
+projection, the D skip, and the final-state carry-over into one launch.
+
 ## Supported quantization
 
 | GGML type | used for | bytes/block |
@@ -216,11 +235,13 @@ post-CUDA-graph path, where decode is no longer launch-bound):
   (silu, output-norm) into the memory-bound GEMVs just adds compute to their
   critical path without saving any launches.
 
-The remaining genuine direction is architectural:
+The remaining genuine directions are architectural:
 
-- **Mamba2 / SSM variants** — the Mamba-1 SSM is done; the selective-scan
-  recurrence is currently a straightforward sequential loop, so a parallel
-  scan (chunked / associative) is the natural next kernel.
+- **Chunked scan for long sequences** — the current scan handles a full sequence
+  in one block (fine up to ~1024 tokens); a two-pass carry-propagation would
+  remove the block-size cap and let very long prompts scan in bounded memory.
+- **Mamba2 / SSM variants** — different SSM parameterizations to stress the
+  scan abstraction further.
 
 ## Honest limits
 
@@ -231,5 +252,5 @@ The remaining genuine direction is architectural:
   runner (no vision/audio, no LoRA adapters).
 - MoE runs on CPU (RAM) at ~0.87 tok/s — correctness-first, partial GPU offload
   (~1.14 tok/s at 10 layers) but still memory-bound.
-- Mamba selective scan is a sequential per-token loop (correct, not fast); the
-  conv/SSM state updates are in-place.
+- Mamba prefill is parallel (associative scan) but decode is still a sequential
+  single-token step; the scan handles ~1024 tokens per block (no chunking yet).
