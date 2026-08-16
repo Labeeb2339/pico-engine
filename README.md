@@ -163,6 +163,23 @@ partial offload does ~35 tok/s; the gap is the CPU path, where llama.cpp has
 hand-tuned multi-threaded AVX kernels and pico-engine uses torch's vectorized
 ops.
 
+## Mamba (SSM) — Mamba-130M
+
+The loader also runs **Mamba** (`general.architecture = "mamba"`), a selective
+state-space model with no attention. Per layer it is: RMSNorm → `in_proj` →
+causal depthwise conv1d → SiLU → selective scan (discretized A, B, C, D) →
+SiLU gate → `out_proj`, with per-layer **conv state** (`d_inner × d_conv-1`) and
+**SSM state** (`d_inner × d_state`) caches instead of a KV cache.
+
+Verified against the HF `state-spaces/mamba-130m` checkpoint: greedy
+first-token **argmax and top-3 match exactly** (logits within F16-vs-fp32
+noise, ~0.10). ~43 tok/s on the RTX 5070 Laptop.
+
+The one real gotcha, found the hard way: **the GGUF `ssm_a` tensor stores
+`A = -exp(A_log)` precomputed — not `A_log`.** I initially applied `-exp()` to
+it again and got coherent-but-garbage output. The fix is to use `ssm_a` as `A`
+directly.
+
 ## Supported quantization
 
 | GGML type | used for | bytes/block |
@@ -201,15 +218,18 @@ post-CUDA-graph path, where decode is no longer launch-bound):
 
 The remaining genuine direction is architectural:
 
-- **Mamba (SSM)** — the remaining stress test for the loader/forward; a
-  non-attention architecture would validate the abstraction.
+- **Mamba2 / SSM variants** — the Mamba-1 SSM is done; the selective-scan
+  recurrence is currently a straightforward sequential loop, so a parallel
+  scan (chunked / associative) is the natural next kernel.
 
 ## Honest limits
 
 - fp32 decode compute (the quantized GEMVs + attention accumulate in fp32, no
   tensor cores); prefill is fp16.
 - Decode throughput is a CUDA-graph capture; prefill is still eager.
-- Two architectures (Qwen2 dense + Qwen2-MoE) — not a general GGUF runner.
-- MoE runs on CPU (RAM) at ~0.87 tok/s — correctness-first, no GPU offload yet.
-- No auto-applied chat template; the caller supplies the template string (the
-  tokenizer does handle `<|im_start|>`/`<|im_end|>` correctly).
+- Three architectures (Qwen2 dense + Qwen2-MoE + Mamba) — not a general GGUF
+  runner (no vision/audio, no LoRA adapters).
+- MoE runs on CPU (RAM) at ~0.87 tok/s — correctness-first, partial GPU offload
+  (~1.14 tok/s at 10 layers) but still memory-bound.
+- Mamba selective scan is a sequential per-token loop (correct, not fast); the
+  conv/SSM state updates are in-place.
