@@ -141,13 +141,12 @@ python -m pico_engine <model.gguf> --prompt "Hello" --max-tokens 64
 
 ## What I would do next
 
-- **Fuse the whole layer into one Triton kernel** — the CUDA graph hides the
-  ~200-launch overhead but still runs ~200 kernels; a single fused
-  RMSNorm→QKV→RoPE→attention→SwiGLU→residual kernel per layer would cut the
-  GPU-side work too (mostly prefill).
-- **fp16 decode** — prefill is already fp16; the decode GEMVs + attention still
-  accumulate in fp32 (no tensor cores on the M=1 path). Quantized fp16 decode
-  could close the remaining decode gap to a hand-tuned kernel.
+- **fp16 decode** — *tested, rejected (measured)*. The quantized GEMVs already
+  dequantize to ≤fp16 precision (Q8_0 = 1 byte/elem, Q5_0/Q6_K/Q4_K ≈ 0.7–0.8),
+  so fp16 would *double* the output projection's bytes and slow it down; the only
+  fp32 matmuls (QKV + o-proj) are ~3% of decode time, and fp16 saves ~0.3% total.
+- **Fuse the whole layer into one Triton kernel** — the remaining kernel-overhead
+  lever (the elementwise ops are ~60% of per-layer GPU time).
 - **More architectures** — the loader/forward is Qwen2/LLaMA-shaped; MoE
   (Qwen2.5-MoE) or Mamba would stress the design.
 
