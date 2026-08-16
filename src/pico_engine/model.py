@@ -4,9 +4,10 @@ Implements RMSNorm, rotary embeddings (rotate-half), grouped-query attention
 with a KV cache, and SwiGLU MLP. Weights come from :mod:`engine` already dequantized; the GGUF linear
 convention is ``out = x @ W.T`` (weights stored (in, out), no transpose).
 
-The hot elementwise/reduction ops (RMSNorm, RoPE) run as fused Triton kernels
-(:mod:`kernels`) because the M=1 decode path is launch-bound, not
-bandwidth-bound. Matmuls stay in torch (cuBLAS).
+The hot elementwise/reduction ops (RMSNorm, RoPE) and single-token decode
+attention run as fused Triton kernels (:mod:`kernels`) because the M=1 decode
+path is CPU-dispatch-bound, not compute/bandwidth-bound. The matmuls stay in
+torch (cuBLAS) — a custom GEMV measured neutral at M=1.
 
 Reference architecture: Qwen2.5 (the target model), which is LLaMA-style.
 """
@@ -18,7 +19,7 @@ from dataclasses import dataclass
 import torch
 import torch.nn.functional as F
 
-from .kernels import rmsnorm, rope, silu_mul
+from .kernels import rmsnorm, rope, silu_mul, decode_attn
 
 
 @dataclass
@@ -113,18 +114,21 @@ class Transformer:
         v_full = torch.cat([cache[1], v.transpose(0, 1)], dim=1)
         new_cache = (k_full, v_full)
 
-        # GQA attention via fused SDPA (flash attention on Blackwell, handles GQA
-        # natively — no repeat_interleave, one kernel instead of einsum+softmax).
-        S = k_full.shape[1]
-        causal = positions[:, None] >= torch.arange(S, device=self.device)[None, :]
-        out = F.scaled_dot_product_attention(
-            q.transpose(0, 1).unsqueeze(0),   # (1, n_head, L, hd)
-            k_full.unsqueeze(0),              # (1, n_kv, S, hd)
-            v_full.unsqueeze(0),              # (1, n_kv, S, hd)
-            attn_mask=causal,
-            enable_gqa=True,
-        )
-        out = out.squeeze(0).transpose(0, 1)  # (L, n_head, hd)
+        # GQA attention. Prefill (L>1) uses fused SDPA with a native causal mask.
+        # Single-token decode uses a dedicated Triton kernel (one launch) instead
+        # of SDPA's dispatch, which was the dominant CPU cost on the launch-bound
+        # decode path.
+        if L > 1:
+            out = F.scaled_dot_product_attention(
+                q.transpose(0, 1).unsqueeze(0),   # (1, n_head, L, hd)
+                k_full.unsqueeze(0),              # (1, n_kv, S, hd)
+                v_full.unsqueeze(0),              # (1, n_kv, S, hd)
+                is_causal=True,
+                enable_gqa=True,
+            )
+            out = out.squeeze(0).transpose(0, 1)  # (L, n_head, hd)
+        else:
+            out = decode_attn(q[0], k_full, v_full).unsqueeze(0)  # (1, n_head, hd)
         out = out.reshape(L, cfg.hidden) @ self._w(f"blk.{i}.attn_output.weight").T
 
         x = x + out

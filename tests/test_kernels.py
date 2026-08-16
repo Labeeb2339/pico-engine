@@ -8,7 +8,7 @@ layout. The wrapper forces ``.contiguous()``; this test pins that regression.
 import torch
 import pytest
 
-from pico_engine.kernels import rmsnorm, rope, silu_mul
+from pico_engine.kernels import rmsnorm, rope, silu_mul, decode_attn
 
 
 def test_rmsnorm_matches_torch():
@@ -66,3 +66,20 @@ def test_silu_mul_matches_torch():
         ref = (gate * torch.sigmoid(gate)) * up
         out = silu_mul(gate_up, ffn)
         assert (out - ref).abs().max().item() < 1e-4
+
+
+def test_decode_attn_matches_torch():
+    # Single-query GQA attention (the decode path). q is fp16 as in the model.
+    torch.manual_seed(0)
+    n_head, n_kv, hd = 14, 2, 64
+    group = n_head // n_kv
+    for S in (1, 17, 130):
+        q = torch.randn(n_head, hd, device="cuda", dtype=torch.float16)
+        k = torch.randn(n_kv, S, hd, device="cuda", dtype=torch.float16)
+        v = torch.randn(n_kv, S, hd, device="cuda", dtype=torch.float16)
+        out = decode_attn(q, k, v)
+        k_rep = k.repeat_interleave(group, dim=0)
+        v_rep = v.repeat_interleave(group, dim=0)
+        ref = torch.nn.functional.scaled_dot_product_attention(
+            q.unsqueeze(1), k_rep, v_rep).squeeze(1)
+        assert (out.float() - ref.float()).abs().max().item() < 0.05

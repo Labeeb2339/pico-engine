@@ -49,29 +49,38 @@ Same GGUF, same prompt, greedy decoding, 128 tokens, RTX 5070 Laptop:
 
 | engine | prefill | decode tok/s |
 |--------|---------|--------------|
-| pico-engine | 0.21 s | **33.5** |
+| pico-engine | 0.21 s | **49.1** |
 | llama.cpp | — | **102.1** |
 
-pico-engine is **~3.0× slower** than llama.cpp — and that gap is honest. The
-decode path is *launch-bound*, not bandwidth- or compute-bound: each generated
-token runs hundreds of tiny kernels (24 layers × ~14 ops), and the M=1 matmuls
-never amortize their launch cost. Two measured wins closed the gap from 21.4 →
-33.5 tok/s:
+pico-engine is **~2.1× slower** than llama.cpp. The decode path is
+*CPU-dispatch-bound*, not compute- or bandwidth-bound: each generated token runs
+hundreds of tiny kernels, and the CPU spends most of its time dispatching them
+while the GPU sits mostly idle. The measured progression:
 
-1. **Fused QKV + gate/up projections** (3→1 and 2→1 matmuls) — 21.4 → 23.2.
-2. **Fused Triton RMSNorm + RoPE kernels** (`src/pico_engine/kernels.py`) — the
-   ~5-op torch RMSNorm and ~4-op torch RoPE collapse to one launch each, ~48×
-   per token — 23.2 → 33.5.
+| change | decode tok/s |
+|--------|--------------|
+| baseline (torch-native forward) | 21.4 |
+| fused QKV + gate/up projections | 23.2 |
+| fused Triton RMSNorm + RoPE | 33.5 |
+| drop dead causal mask | 36.7 |
+| fused Triton decode attention | **49.1** |
 
-A third pass fused the remaining elementwise FFN ops (SiLU·gate and the
-residual add) and measured **neutral** — the bottleneck had moved to the
-cuBLAS matmul launches themselves, which need custom GEMM kernels to reduce.
+Two hypotheses were tested and **rejected**, both measured:
 
-**fp16 and `scaled_dot_product_attention` did not help** — fp16's memory savings
-don't matter when you're not bandwidth-bound, and flash attention pays off at
-long sequences, not M=1 decode. llama.cpp's remaining edge is hand-fused CUDA
-kernels (fused SwiGLU + RMSNorm-QKV), which is the next lever. (Greedy outputs
-diverge slightly from llama.cpp — fp32-vs-fp16 numerics, not a bug.)
+- **Custom Triton GEMV kernels** for the four M=1 matmuls/layer — **neutral**
+  (0.98–1.18× per matmul). `torch.profiler` showed the matmuls are only ~10% of
+  decode time; cuBLAS is already fine at M=1.
+- **fp16 weights** — **slower** (18 tok/s), not faster. Halving the bytes
+  doesn't help when the path isn't bandwidth-bound.
+
+What actually moved the needle was profiling, not guessing. The profiler showed
+`scaled_dot_product_attention` dispatch at **43% of CPU time** plus a causal mask
+rebuilt with `arange`+`ge` on every layer of every step (**12%**) — and that
+mask is *all-True* for single-token decode, so it was dead work. Removing it and
+replacing SDPA's dispatch with one fused Triton decode-attention kernel (online
+softmax, GQA — `src/pico_engine/kernels.py:decode_attn`) took decode 33.5 →
+49.1 tok/s. (Greedy outputs diverge slightly from llama.cpp — fp32-vs-fp16
+numerics, not a bug.)
 
 ```
 $ python -m pico_engine.benchmark models/qwen2.5-0.5b-instruct-q4_k_m.gguf
@@ -101,12 +110,16 @@ python -m pico_engine <model.gguf> --prompt "Hello" --max-tokens 64
 
 ## What I would do next
 
-- Replace the four cuBLAS matmuls per layer (QKV, gate/up, down, attn-output)
-  with fused Triton GEMM kernels — the remaining launch-bound lever. Fusing the
-  elementwise FFN ops (SiLU·gate via `silu_mul`, residual add via `addmm`) was
-  measured and did **not** move the needle: the bottleneck is now the matmul
-  launches themselves, not the elementwise ops.
-- Preallocate the KV cache (avoid the per-step `torch.cat` reallocation).
+- **Fuse the whole layer** — one Triton kernel for RMSNorm→QKV→RoPE→attention→
+  SwiGLU MLP→residual would collapse the remaining ~15 launches/layer (four
+  matmuls + three elementwise kernels + cats + reshapes) into one or two. This
+  is the real remaining dispatch lever — the GEMV/GEMM work was measured neutral.
+- **Preallocate the KV cache** — the per-step `torch.cat` reallocates and copies
+  O(S) on every token.
+- **Quantized matmuls** — weights are dequantized to fp32 (~2.5 GB read/token);
+  multiplying directly against the 4/5/8-bit blocks like llama.cpp cuts that
+  ~4×. This only pays off once the dispatch is tamed (fp16 was slower, so the
+  path isn't bandwidth-bound yet).
 
 ## Honest limits
 

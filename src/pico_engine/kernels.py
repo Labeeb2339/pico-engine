@@ -85,3 +85,59 @@ def silu_mul(gate_up: torch.Tensor, ffn: int) -> torch.Tensor:
     grid = (triton.cdiv(n, BLOCK),)
     _silu_mul_fwd[grid](gate_up, out, ffn, n, BLOCK=BLOCK, num_warps=4)
     return out
+
+
+@triton.jit
+def _decode_attn_fwd(q_ptr, k_ptr, v_ptr, o_ptr, S, scale,
+                     HD: tl.constexpr, GROUP: tl.constexpr, BLOCK_S: tl.constexpr):
+    # One program per query head. Single-query (decode) GQA attention with
+    # online softmax over the cached keys/values.
+    h = tl.program_id(0)
+    kv = h // GROUP                    # kv head this query head maps to (GQA)
+    offs_d = tl.arange(0, HD)
+    q = tl.load(q_ptr + h * HD + offs_d).to(tl.float32)   # (HD,)
+
+    m_i = tl.full((), float("-inf"), tl.float32)
+    l_i = tl.zeros((), tl.float32)
+    acc = tl.zeros((HD,), tl.float32)
+
+    for s0 in range(0, S, BLOCK_S):
+        offs_s = s0 + tl.arange(0, BLOCK_S)
+        mask_s = offs_s < S
+        k = tl.load(k_ptr + kv * S * HD + offs_s[:, None] * HD + offs_d[None, :],
+                    mask=mask_s[:, None], other=0.0).to(tl.float32)
+        v = tl.load(v_ptr + kv * S * HD + offs_s[:, None] * HD + offs_d[None, :],
+                    mask=mask_s[:, None], other=0.0).to(tl.float32)
+        s = tl.sum(k * q[None, :], axis=1) * scale          # (BLOCK_S,)
+        s = tl.where(mask_s, s, float("-inf"))
+        m_new = tl.maximum(m_i, tl.max(s, axis=0))
+        alpha = tl.exp(m_i - m_new)
+        p = tl.exp(s - m_new)                                # (BLOCK_S,)
+        l_i = l_i * alpha + tl.sum(p, axis=0)
+        acc = acc * alpha + tl.sum(p[:, None] * v, axis=0)
+        m_i = m_new
+
+    acc = acc / l_i
+    tl.store(o_ptr + h * HD + offs_d, acc.to(tl.float16))
+
+
+def decode_attn(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor,
+                scale: float | None = None) -> torch.Tensor:
+    """Single-query GQA attention for decode.
+
+    q: (n_head, hd); k/v: (n_kv, S, hd) (the running cache). Returns
+    (n_head, hd). One Triton launch replaces the SDPA dispatch (which was the
+    dominant CPU cost on the launch-bound decode path).
+    """
+    q = q.contiguous()
+    k = k.contiguous()
+    v = v.contiguous()
+    n_head, hd = q.shape
+    n_kv, S, _ = k.shape
+    if scale is None:
+        scale = hd ** -0.5
+    group = n_head // n_kv
+    out = torch.empty(n_head, hd, device=q.device, dtype=q.dtype)
+    _decode_attn_fwd[(n_head,)](q, k, v, out, S, scale,
+                                HD=hd, GROUP=group, BLOCK_S=64, num_warps=4)
+    return out
