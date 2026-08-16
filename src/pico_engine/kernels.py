@@ -150,3 +150,34 @@ def decode_attn(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor,
     _decode_attn_fwd[(n_head,)](q, k, v, out, S, stride, scale,
                                 HD=hd, GROUP=group, BLOCK_S=64, num_warps=4)
     return out
+
+
+@triton.jit
+def _q8_0_gemv_fwd(x_ptr, qs_ptr, d_ptr, out_ptr, K, NB,
+                   BLOCK_N: tl.constexpr):
+    # out[n] = sum_b d[n,b] * sum_k qs[n, b*32+k] * x[b*32+k]
+    # qs: int8 (N, K); d: fp32 (N, NB=K/32). One program per BLOCK_N output rows.
+    pid = tl.program_id(0)
+    offs_n = pid * BLOCK_N + tl.arange(0, BLOCK_N)
+    acc = tl.zeros((BLOCK_N,), tl.float32)
+    for b in range(NB):
+        offs_k = tl.arange(0, 32)
+        xv = tl.load(x_ptr + b * 32 + offs_k).to(tl.float32)          # (32,)
+        qs = tl.load(qs_ptr + offs_n[:, None] * K + (b * 32 + offs_k)[None, :])  # (BLOCK_N, 32) int8
+        d = tl.load(d_ptr + offs_n * NB + b)                          # (BLOCK_N,)
+        acc += d * tl.sum(qs.to(tl.float32) * xv[None, :], axis=1)
+    tl.store(out_ptr + offs_n, acc)
+
+
+def q8_0_gemv(x: torch.Tensor, qs: torch.Tensor, d: torch.Tensor) -> torch.Tensor:
+    """Q8_0 quantized GEMV: out = x @ W.T where W is Q8_0 (qs int8 (N,K), d fp32 (N,K/32))."""
+    x = x.contiguous().float()
+    qs = qs.contiguous()
+    d = d.contiguous()
+    K = x.numel()
+    N = qs.shape[0]
+    NB = K // 32
+    out = torch.empty(N, device=x.device, dtype=torch.float32)
+    BLOCK_N = 128
+    _q8_0_gemv_fwd[(triton.cdiv(N, BLOCK_N),)](x, qs, d, out, K, NB, BLOCK_N=BLOCK_N, num_warps=4)
+    return out

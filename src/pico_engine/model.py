@@ -19,7 +19,7 @@ from dataclasses import dataclass
 import torch
 import torch.nn.functional as F
 
-from .kernels import rmsnorm, rope, silu_mul, decode_attn
+from .kernels import rmsnorm, rope, silu_mul, decode_attn, q8_0_gemv
 
 
 @dataclass
@@ -37,10 +37,12 @@ class ModelConfig:
 
 
 class Transformer:
-    def __init__(self, cfg: ModelConfig, weights: dict[str, torch.Tensor], device: torch.device):
+    def __init__(self, cfg: ModelConfig, weights: dict[str, torch.Tensor], device: torch.device,
+                 quant: dict | None = None):
         self.cfg = cfg
         self.device = device
         self.w = weights  # name -> tensor on device
+        self.quant = quant or {}
         # token embedding: GGUF (hidden, vocab) -> loaded as (vocab, hidden); direct lookup
         self.embed = weights["token_embd.weight"]
 
@@ -92,7 +94,11 @@ class Transformer:
         for i in range(cfg.n_layers):
             x = self._layer(i, x, pos, cos, sin, cache[i])
         x = rmsnorm(x, self._w("output_norm.weight"), cfg.eps)
-        logits = x[-1] @ self._w("output.weight").T  # (vocab,)
+        if "output" in self.quant:
+            qs, d = self.quant["output"]
+            logits = q8_0_gemv(x[-1], qs, d)          # Q8_0 quantized projection
+        else:
+            logits = x[-1] @ self._w("output.weight").T
         return logits
 
     def _layer(self, i: int, x: torch.Tensor, pos: int, cos: torch.Tensor, sin: torch.Tensor,
@@ -104,15 +110,13 @@ class Transformer:
         # attention norm
         h = rmsnorm(x, self._w(f"blk.{i}.attn_norm.weight"), cfg.eps)
 
-        qkv = h @ self.qkv_w[i].T + self.qkv_b[i]  # (L, n_head*hd + 2*n_kv*hd)
-        q, k, v = qkv.split([cfg.hidden, cfg.n_kv_head * cfg.head_dim, cfg.n_kv_head * cfg.head_dim], dim=-1)
-        q = q.view(L, cfg.n_head, cfg.head_dim)
-        k = k.view(L, cfg.n_kv_head, cfg.head_dim)
-        v = v.view(L, cfg.n_kv_head, cfg.head_dim)
-
-        # rotary embeddings (rotate-half, fused)
-        q = rope(q, cos, sin)
-        k = rope(k, cos, sin)
+        qkv = F.linear(h, self.qkv_w[i], self.qkv_b[i])  # fused matmul + bias (1 launch)
+        # rotary embeddings: rope q (14 heads) + k (2 heads) in one fused launch
+        qk = qkv[:, :cfg.hidden + cfg.n_kv_head * cfg.head_dim].view(L, cfg.n_head + cfg.n_kv_head, cfg.head_dim)
+        qk = rope(qk, cos, sin)
+        q = qk[:, :cfg.n_head]                                    # (L, n_head, hd)
+        k = qk[:, cfg.n_head:]                                    # (L, n_kv, hd)
+        v = qkv[:, cfg.hidden + cfg.n_kv_head * cfg.head_dim:].view(L, cfg.n_kv_head, cfg.head_dim)
 
         # write k/v into the pre-allocated cache at their positions (in place,
         # no torch.cat / reallocation per step)

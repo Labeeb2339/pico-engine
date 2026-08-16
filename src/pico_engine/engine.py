@@ -19,7 +19,8 @@ class Engine:
         self.gguf = load_gguf(gguf_path)
         self.cfg = self._build_config()
         self.weights = self._load_weights()
-        self.model = Transformer(self.cfg, self.weights, self.device)
+        self.quant = self._prep_quant()
+        self.model = Transformer(self.cfg, self.weights, self.device, self.quant)
         self.tok = tokenizer_from_gguf(self.gguf.metadata)
 
     def _build_config(self) -> ModelConfig:
@@ -62,6 +63,28 @@ class Engine:
     def _empty_cache(self, capacity: int) -> list[tuple[torch.Tensor, torch.Tensor]]:
         empty = lambda: torch.zeros(self.cfg.n_kv_head, capacity, self.cfg.head_dim, device=self.device)
         return [(empty(), empty()) for _ in range(self.cfg.n_layers)]
+
+    def _prep_quant(self) -> dict:
+        """Preprocess quantized tensors into a kernel-friendly split form.
+
+        The model multiplies directly against the quantized values instead of
+        fp32-dequantized copies (the fp32 matmul reads ~4x the bytes). Q8_0
+        becomes (qs int8 (N,K), d fp32 (N,K/32)); the output projection uses it.
+        """
+        quant: dict = {}
+        t = next(t for t in self.gguf.tensors if t.name == "output.weight")
+        if t.ggml_type != 8:
+            return quant  # not Q8_0; fall back to fp32 matmul
+        with open(self.gguf.path, "rb") as f:
+            f.seek(self.gguf.data_start + t.offset)
+            raw = f.read(t.n_bytes)
+        N, K = t.shape[::-1]
+        NB = K // 32
+        raw_t = torch.frombuffer(raw, dtype=torch.uint8).clone().to(self.device).view(N, NB, 34)
+        d = raw_t[:, :, 0:2].view(torch.float16).float().contiguous()   # (N, NB)
+        qs = raw_t[:, :, 2:34].view(torch.int8).reshape(N, K).contiguous()  # (N, K)
+        quant["output"] = (qs, d)
+        return quant
 
     @torch.inference_mode()
     def generate(self, prompt: str, max_tokens: int = 64, temperature: float = 0.7,
