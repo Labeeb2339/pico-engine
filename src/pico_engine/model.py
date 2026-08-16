@@ -18,7 +18,7 @@ from dataclasses import dataclass
 import torch
 import torch.nn.functional as F
 
-from .kernels import rmsnorm, rope
+from .kernels import rmsnorm, rope, silu_mul
 
 
 @dataclass
@@ -33,10 +33,6 @@ class ModelConfig:
     rope_base: float
     eps: float           # RMSNorm epsilon
     context_len: int
-
-
-def _silu(x: torch.Tensor) -> torch.Tensor:
-    return x * torch.sigmoid(x)
 
 
 class Transformer:
@@ -136,8 +132,7 @@ class Transformer:
         # SwiGLU MLP
         h = rmsnorm(x, self._w(f"blk.{i}.ffn_norm.weight"), cfg.eps)
         gate_up = h @ self.gu_w[i].T                      # (L, 2*ffn_dim)
-        gate, up = gate_up.split([cfg.ffn_dim, cfg.ffn_dim], dim=-1)
-        gate = _silu(gate)
-        x = x + (gate * up) @ self._w(f"blk.{i}.ffn_down.weight").T
+        act = silu_mul(gate_up, cfg.ffn_dim)              # (L, ffn_dim) = silu(gate)*up
+        x = torch.addmm(x, act, self._w(f"blk.{i}.ffn_down.weight").T)
 
         return x, new_cache

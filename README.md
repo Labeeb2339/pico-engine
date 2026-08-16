@@ -63,6 +63,10 @@ never amortize their launch cost. Two measured wins closed the gap from 21.4 →
    ~5-op torch RMSNorm and ~4-op torch RoPE collapse to one launch each, ~48×
    per token — 23.2 → 33.5.
 
+A third pass fused the remaining elementwise FFN ops (SiLU·gate and the
+residual add) and measured **neutral** — the bottleneck had moved to the
+cuBLAS matmul launches themselves, which need custom GEMM kernels to reduce.
+
 **fp16 and `scaled_dot_product_attention` did not help** — fp16's memory savings
 don't matter when you're not bandwidth-bound, and flash attention pays off at
 long sequences, not M=1 decode. llama.cpp's remaining edge is hand-fused CUDA
@@ -97,9 +101,11 @@ python -m pico_engine <model.gguf> --prompt "Hello" --max-tokens 64
 
 ## What I would do next
 
-- Fuse the SwiGLU down-projection (SiLU·gate + down matmul) into one Triton GEMM
-  with a fused epilogue — the remaining launch-bound lever.
-- Fuse the residual adds into the matmul epilogues.
+- Replace the four cuBLAS matmuls per layer (QKV, gate/up, down, attn-output)
+  with fused Triton GEMM kernels — the remaining launch-bound lever. Fusing the
+  elementwise FFN ops (SiLU·gate via `silu_mul`, residual add via `addmm`) was
+  measured and did **not** move the needle: the bottleneck is now the matmul
+  launches themselves, not the elementwise ops.
 - Preallocate the KV cache (avoid the per-step `torch.cat` reallocation).
 
 ## Honest limits

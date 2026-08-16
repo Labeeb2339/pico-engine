@@ -8,7 +8,7 @@ layout. The wrapper forces ``.contiguous()``; this test pins that regression.
 import torch
 import pytest
 
-from pico_engine.kernels import rmsnorm, rope
+from pico_engine.kernels import rmsnorm, rope, silu_mul
 
 
 def test_rmsnorm_matches_torch():
@@ -55,3 +55,14 @@ def test_rope_handles_non_contiguous_prefill():
 
     assert (rope(q, c, s) - ref(q)).abs().max().item() < 1e-5
     assert (rope(k, c, s) - ref(k)).abs().max().item() < 1e-5
+
+
+def test_silu_mul_matches_torch():
+    torch.manual_seed(0)
+    for L in (1, 5):
+        ffn = 4864
+        gate_up = torch.randn(L, 2 * ffn, device="cuda")
+        gate, up = gate_up[:, :ffn], gate_up[:, ffn:]
+        ref = (gate * torch.sigmoid(gate)) * up
+        out = silu_mul(gate_up, ffn)
+        assert (out - ref).abs().max().item() < 1e-4

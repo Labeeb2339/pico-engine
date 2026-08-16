@@ -57,3 +57,31 @@ def rope(x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor) -> torch.Tensor:
     out = torch.empty_like(x)
     _rope_fwd[(L * n_head,)](x, cos, sin, out, n_head, half, H=half, num_warps=2)
     return out
+
+
+@triton.jit
+def _silu_mul_fwd(gate_up_ptr, out_ptr, ffn, n, BLOCK: tl.constexpr):
+    # gate_up is (L, 2*ffn) with gate in [:, :ffn] and up in [:, ffn:].
+    # out is (L, ffn) = silu(gate) * up.
+    pid = tl.program_id(0)
+    offs = pid * BLOCK + tl.arange(0, BLOCK)
+    mask = offs < n
+    row = offs // ffn
+    col = offs % ffn
+    g = tl.load(gate_up_ptr + row * 2 * ffn + col, mask=mask)
+    u = tl.load(gate_up_ptr + row * 2 * ffn + ffn + col, mask=mask)
+    act = g * tl.sigmoid(g) * u
+    tl.store(out_ptr + offs, act, mask=mask)
+
+
+def silu_mul(gate_up: torch.Tensor, ffn: int) -> torch.Tensor:
+    """Fused silu(gate) * up, reading gate/up directly from the interleaved
+    (L, 2*ffn) gate/up tensor (no split, no copies)."""
+    gate_up = gate_up.contiguous()
+    L = gate_up.shape[0]
+    out = torch.empty(L, ffn, device=gate_up.device, dtype=gate_up.dtype)
+    n = L * ffn
+    BLOCK = 1024
+    grid = (triton.cdiv(n, BLOCK),)
+    _silu_mul_fwd[grid](gate_up, out, ffn, n, BLOCK=BLOCK, num_warps=4)
+    return out
