@@ -49,13 +49,12 @@ Same GGUF, same prompt, greedy decoding, 128 tokens, RTX 5070 Laptop:
 
 | engine | prefill | decode tok/s |
 |--------|---------|--------------|
-| pico-engine | 0.21 s | **53.0** |
+| pico-engine | 0.21 s | **57** |
 | llama.cpp | — | **102.1** |
 
-pico-engine is **~1.9× slower** than llama.cpp. The decode path is
-*CPU-dispatch-bound*, not compute- or bandwidth-bound: each generated token runs
-hundreds of tiny kernels, and the CPU spends most of its time dispatching them
-while the GPU sits mostly idle. The measured progression:
+pico-engine is **~1.8× slower** than llama.cpp. The decode path is
+*launch- and bandwidth-bound*: each token runs hundreds of small kernels, and the
+matmuls read the fp32-dequantized weights. The measured progression:
 
 | change | decode tok/s |
 |--------|--------------|
@@ -64,7 +63,8 @@ while the GPU sits mostly idle. The measured progression:
 | fused Triton RMSNorm + RoPE | 33.5 |
 | drop dead causal mask | 36.7 |
 | fused Triton decode attention | 49.1 |
-| preallocate KV cache + hoist RoPE gather | **53.0** |
+| preallocate KV cache + hoist RoPE gather | 53.0 |
+| Q8_0/Q5_0 quantized matmuls + fused norm/rope/bias | **57** |
 
 Two hypotheses were tested and **rejected**, both measured:
 
@@ -113,13 +113,13 @@ python -m pico_engine <model.gguf> --prompt "Hello" --max-tokens 64
 ## What I would do next
 
 - **Fuse the whole layer** — one Triton kernel for RMSNorm→QKV→RoPE→attention→
-  SwiGLU MLP→residual would collapse the remaining ~10 launches/layer (four
-  matmuls + three elementwise kernels + reshapes) into one or two. This is the
-  real remaining dispatch lever — the GEMV/GEMM work was measured neutral.
-- **Quantized matmuls** — weights are dequantized to fp32 (~2.5 GB read/token);
-  multiplying directly against the 4/5/8-bit blocks like llama.cpp cuts that
-  ~4×. This only pays off once the dispatch is tamed (fp16 was slower, so the
-  path isn't bandwidth-bound yet).
+  SwiGLU MLP→residual would collapse the remaining ~9 launches/layer into one.
+  This is the real remaining lever: the GPU is launch-bound on the small kernels
+  (attention/elementwise ~9ms/token) and bandwidth-bound on the fp32 matmuls.
+- **Quantize the remaining matmuls** — `ffn_down` (Q4_K/Q6_K) still dequantizes
+  to fp32; Q8_0 (output) and Q5_0 (gate/up) already multiply against the
+  quantized blocks directly. The QKV and attn-output matmuls are small enough to
+  be launch-bound, so quantizing them would not help.
 
 ## Honest limits
 
