@@ -214,3 +214,47 @@ def q5_0_gemv(x: torch.Tensor, qs: torch.Tensor, d: torch.Tensor) -> torch.Tenso
     BLOCK_N = 128
     _q5_0_gemv_fwd[(triton.cdiv(N, BLOCK_N),)](x, qs, d, out, K, NB, BLOCK_N=BLOCK_N, num_warps=4)
     return out
+
+
+@triton.jit
+def _q5_0_gemv_norm_fwd(x_ptr, w_ptr, qs_ptr, d_ptr, out_ptr, K, NB, eps,
+                        BLOCK_N: tl.constexpr, BLOCK_K: tl.constexpr):
+    # Fused RMSNorm + Q5_0 GEMV: out[n] = sum_b d[n,b]*(sum_k q5[n,k]*h[k] - 16*sum_k h[k]),
+    # h = x * rstd * w (rmsnorm). One launch instead of rmsnorm + gemv.
+    pid = tl.program_id(0)
+    offs_n = pid * BLOCK_N + tl.arange(0, BLOCK_N)
+    # scalar rstd over the full K (redundant per program, but K is small)
+    offs_k = tl.arange(0, BLOCK_K)
+    mask = offs_k < K
+    xv = tl.load(x_ptr + offs_k, mask=mask, other=0.0).to(tl.float32)
+    var = tl.sum(xv * xv, axis=0) / K
+    rstd = 1.0 / tl.sqrt(var + eps)
+    acc = tl.zeros((BLOCK_N,), tl.float32)
+    for b in range(NB):
+        offs_32 = tl.arange(0, 32)
+        k_idx = b * 32 + offs_32
+        xb = tl.load(x_ptr + k_idx).to(tl.float32)
+        wb = tl.load(w_ptr + k_idx).to(tl.float32)
+        h = xb * rstd * wb                                   # (32,) normalized
+        qs = tl.load(qs_ptr + offs_n[:, None] * K + k_idx[None, :])  # (BLOCK_N, 32) int8
+        d = tl.load(d_ptr + offs_n * NB + b)
+        sx = tl.sum(h, axis=0)
+        dot = tl.sum(qs.to(tl.float32) * h[None, :], axis=1)
+        acc += d * (dot - 16.0 * sx)
+    tl.store(out_ptr + offs_n, acc)
+
+
+def q5_0_gemv_norm(x: torch.Tensor, weight: torch.Tensor, qs: torch.Tensor, d: torch.Tensor,
+                   eps: float) -> torch.Tensor:
+    """Fused RMSNorm(x, weight) + Q5_0 GEMV (one launch)."""
+    x = x.contiguous().float()
+    weight = weight.contiguous().float()
+    qs = qs.contiguous()
+    d = d.contiguous()
+    K = x.numel()
+    N = qs.shape[0]
+    NB = K // 32
+    out = torch.empty(N, device=x.device, dtype=torch.float32)
+    _q5_0_gemv_norm_fwd[(triton.cdiv(N, 128),)](
+        x, weight, qs, d, out, K, NB, eps, BLOCK_N=128, BLOCK_K=triton.next_power_of_2(K), num_warps=4)
+    return out

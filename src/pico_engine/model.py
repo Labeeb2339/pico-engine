@@ -19,7 +19,7 @@ from dataclasses import dataclass
 import torch
 import torch.nn.functional as F
 
-from .kernels import rmsnorm, rope, silu_mul, decode_attn, q8_0_gemv, q5_0_gemv
+from .kernels import rmsnorm, rope, silu_mul, decode_attn, q8_0_gemv, q5_0_gemv, q5_0_gemv_norm
 
 
 @dataclass
@@ -148,11 +148,13 @@ class Transformer:
         x = torch.addmm(x, out.reshape(L, cfg.hidden), self._w(f"blk.{i}.attn_output.weight").T)
 
         # SwiGLU MLP
-        h = rmsnorm(x, self._w(f"blk.{i}.ffn_norm.weight"), cfg.eps)
         if L == 1 and "gu" in self.quant:
             gu_q5, gu_d = self.quant["gu"]
-            gate_up = q5_0_gemv(h[0], gu_q5[i], gu_d[i]).unsqueeze(0)  # Q5_0 quantized
+            # fused RMSNorm + Q5_0 gate/up GEMV (one launch instead of norm + matmul)
+            gate_up = q5_0_gemv_norm(x[0], self._w(f"blk.{i}.ffn_norm.weight"),
+                                     gu_q5[i], gu_d[i], cfg.eps).unsqueeze(0)
         else:
+            h = rmsnorm(x, self._w(f"blk.{i}.ffn_norm.weight"), cfg.eps)
             gate_up = h @ self.gu_w[i].T                      # (L, 2*ffn_dim)
         act = silu_mul(gate_up, cfg.ffn_dim)              # (L, ffn_dim) = silu(gate)*up
         x = torch.addmm(x, act, self._w(f"blk.{i}.ffn_down.weight").T)
