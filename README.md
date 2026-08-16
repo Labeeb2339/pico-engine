@@ -45,16 +45,26 @@ and runs the same forward pass, all written by hand.
 
 ## Benchmark vs llama.cpp
 
-Same GGUF, same prompt, greedy decoding, 128 tokens, RTX 5070 Laptop:
+Same GGUF, greedy decoding, RTX 5070 Laptop, both engines on the GPU:
 
-| engine | prefill | decode tok/s |
-|--------|---------|--------------|
-| pico-engine | 0.08 s | **149.0** |
-| llama.cpp | — | **108.1** |
+| engine | prefill (277 tok) | decode tok/s |
+|--------|-------------------|--------------|
+| pico-engine | **7,950** | **149** |
+| llama.cpp (CUDA) | **28,057** | **502** |
 
-pico-engine is **~1.4× faster** than llama.cpp. The decode path was
-*CPU-dispatch-bound*: ~200 kernel launches per token meant the CPU, not the
-GPU, was the bottleneck. The measured progression:
+llama.cpp — a decade-mature C++ engine with fp16 tensor-core matmuls and flash
+attention — is **~3.5× faster on prefill** and **~3.4× faster on decode**. That
+is the honest gap, and it is the expected one: pico-engine's decode still
+accumulates in fp32 (no tensor cores) and its prefill is eager.
+
+An earlier revision of this README claimed pico-engine was ~1.4× faster than
+llama.cpp. That was measured against a **CPU-only** `llama-cpp-python` wheel, so
+it was GPU-vs-CPU, not apples-to-apples — corrected here. (Against that CPU
+build pico-engine does win, 149 vs ~108 decode tok/s — a real milestone for a
+from-scratch engine — but the meaningful bar is the CUDA build.)
+
+The decode path was *CPU-dispatch-bound*: ~200 kernel launches per token meant
+the CPU, not the GPU, was the bottleneck. The measured progression:
 
 | change | decode tok/s |
 |--------|--------------|
@@ -70,10 +80,9 @@ GPU, was the bottleneck. The measured progression:
 
 **Prefill** is fp16 (tensor cores + flash attention via `torch.autocast`); the
 decode path stays fp32 for the CUDA-graph capture. On a 277-token prompt,
-prefill is **37.4 ms (7401 tok/s)** vs llama.cpp's **358 ms (773 tok/s)** —
-~9.6× faster — and 1.58× faster than our own fp32 prefill (54 ms). (llama.cpp's
-prefill number reflects a prebuilt wheel without flash attention; take the exact
-ratio with that caveat.)
+prefill is **34.8 ms (7,950 tok/s)** — 1.6× faster than our own fp32 prefill
+(54 ms). llama.cpp's CUDA build with flash attention does the same prefill at
+**28,057 tok/s** (~3.5× faster), which is the honest reference point.
 
 Two hypotheses were tested and **rejected**, both measured:
 
