@@ -76,6 +76,34 @@ def _dequant_q8_0(blocks: np.ndarray, n: int) -> np.ndarray:
     return (qs * d[:, None]).reshape(-1)
 
 
+def unpack_q5_0(blocks: np.ndarray, n: int) -> tuple[np.ndarray, np.ndarray]:
+    """Unpack Q5_0 into (q5 int8 0..31, d fp32) *without* the -16 offset.
+
+    The GEMV kernel applies ``d * (sum(q5*x) - 16*sum(x))`` itself, so this
+    splits the quantized tensor into its two kernel-friendly pieces (int8 values
+    + per-block fp32 scale) rather than dequantizing to fp32.
+    """
+    nb = n // 32
+    blocks = blocks[: nb * 22].reshape(nb, 22)
+    d = blocks[:, :2].view(np.float16).astype(np.float32).reshape(nb)
+    qh = blocks[:, 2:6].view(np.uint32).reshape(nb, 1)
+    qs = blocks[:, 6:22]
+    j = np.arange(16, dtype=np.uint32)
+    lo = ((qs & 0xF) | (((qh >> j) & 1) << 4).astype(np.uint8))
+    hi = ((qs >> 4) | (((qh >> (j + 16)) & 1) << 4).astype(np.uint8))
+    q5 = np.concatenate([lo, hi], axis=-1).reshape(-1).astype(np.int8)
+    return q5, d
+
+
+def unpack_q8_0(blocks: np.ndarray, n: int) -> tuple[np.ndarray, np.ndarray]:
+    """Unpack Q8_0 into (qs int8, d fp32) for the quantized GEMV kernel."""
+    nb = n // 32
+    blocks = blocks[: nb * 34].reshape(nb, 34)
+    d = blocks[:, :2].view(np.float16).astype(np.float32).reshape(nb)
+    qs = blocks[:, 2:].view(np.int8)
+    return qs.reshape(-1), d
+
+
 def _scale_min_k4(j: int, scales: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
     """Unpack the j-th 6-bit scale and 6-bit min from a 12-byte scales array."""
     if j < 4:

@@ -19,7 +19,7 @@ from dataclasses import dataclass
 import torch
 import torch.nn.functional as F
 
-from .kernels import rmsnorm, rope, silu_mul, decode_attn, q8_0_gemv
+from .kernels import rmsnorm, rope, silu_mul, decode_attn, q8_0_gemv, q5_0_gemv
 
 
 @dataclass
@@ -144,13 +144,16 @@ class Transformer:
             out = out.squeeze(0).transpose(0, 1)       # (L, n_head, hd)
         else:
             out = decode_attn(q[0], k_buf, v_buf, S=S, stride=capacity).unsqueeze(0)
-        out = out.reshape(L, cfg.hidden) @ self._w(f"blk.{i}.attn_output.weight").T
-
-        x = x + out
+        # o-projection + residual fused into one addmm (1 launch instead of matmul+add)
+        x = torch.addmm(x, out.reshape(L, cfg.hidden), self._w(f"blk.{i}.attn_output.weight").T)
 
         # SwiGLU MLP
         h = rmsnorm(x, self._w(f"blk.{i}.ffn_norm.weight"), cfg.eps)
-        gate_up = h @ self.gu_w[i].T                      # (L, 2*ffn_dim)
+        if L == 1 and "gu" in self.quant:
+            gu_q5, gu_d = self.quant["gu"]
+            gate_up = q5_0_gemv(h[0], gu_q5[i], gu_d[i]).unsqueeze(0)  # Q5_0 quantized
+        else:
+            gate_up = h @ self.gu_w[i].T                      # (L, 2*ffn_dim)
         act = silu_mul(gate_up, cfg.ffn_dim)              # (L, ffn_dim) = silu(gate)*up
         x = torch.addmm(x, act, self._w(f"blk.{i}.ffn_down.weight").T)
 
