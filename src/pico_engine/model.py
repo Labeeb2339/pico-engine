@@ -1,9 +1,13 @@
 """LLaMA/Qwen-style transformer forward pass, from scratch.
 
 Implements RMSNorm, rotary embeddings (rotate-half), grouped-query attention
-with a KV cache, and SwiGLU MLP. Weights come from :mod:`engine` as fp32 torch
-tensors already dequantized; the GGUF linear convention is ``out = x @ W``
+with a KV cache, and SwiGLU MLP. Weights come from :mod:`engine` already
+dequantized and cast to fp16; the GGUF linear convention is ``out = x @ W.T``
 (i.e. weights are stored (in_features, out_features), no transpose).
+
+Compute runs in fp16 for tensor-core matmuls. The two numerically-sensitive
+reductions — RMSNorm mean/rsqrt and the attention softmax — are done in fp32
+and cast back, matching llama.cpp's mixed-precision approach.
 
 Reference architecture: Qwen2.5 (the target model), which is LLaMA-style.
 """
@@ -34,36 +38,47 @@ def _silu(x: torch.Tensor) -> torch.Tensor:
     return x * torch.sigmoid(x)
 
 
-class RMSNorm(torch.nn.Module):
-    def __init__(self, weight: torch.Tensor, eps: float):
-        super().__init__()
-        self.weight = weight  # (hidden,)
-        self.eps = eps
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        # x: (..., hidden)
-        rstd = torch.rsqrt(x.pow(2).mean(-1, keepdim=True) + self.eps)
-        return x * rstd * self.weight
-
-
 class Transformer:
     def __init__(self, cfg: ModelConfig, weights: dict[str, torch.Tensor], device: torch.device):
         self.cfg = cfg
         self.device = device
-        self.w = weights  # name -> tensor on device (already in numpy/C order)
+        self.w = weights  # name -> fp16 tensor on device
         # token embedding: GGUF (hidden, vocab) -> loaded as (vocab, hidden); direct lookup
         self.embed = weights["token_embd.weight"]
 
-        # precompute rotary cos/sin tables: (context_len, head_dim//2)
+        # rotary cos/sin tables — (context_len, head_dim//2)
         inv_freq = 1.0 / (cfg.rope_base ** (torch.arange(0, cfg.head_dim, 2, device=device) / cfg.head_dim))
         pos = torch.arange(cfg.context_len, device=device, dtype=torch.float32)
         angles = pos[:, None] * inv_freq[None, :]
-        self.cos = angles.cos()  # (ctx, hd/2)
+        self.cos = angles.cos()
         self.sin = angles.sin()
 
-    # ---- weight accessors (GGUF layout: x @ W) ----
+        # Fuse the per-layer QKV and gate/up projections into single matmuls
+        # (fewer kernel launches for the launch-bound M=1 decode path).
+        self.qkv_w, self.qkv_b, self.gu_w = [], [], []
+        for i in range(cfg.n_layers):
+            self.qkv_w.append(torch.cat([
+                self.w[f"blk.{i}.attn_q.weight"],
+                self.w[f"blk.{i}.attn_k.weight"],
+                self.w[f"blk.{i}.attn_v.weight"],
+            ], dim=0))
+            self.qkv_b.append(torch.cat([
+                self.w[f"blk.{i}.attn_q.bias"],
+                self.w[f"blk.{i}.attn_k.bias"],
+                self.w[f"blk.{i}.attn_v.bias"],
+            ]))
+            self.gu_w.append(torch.cat([
+                self.w[f"blk.{i}.ffn_gate.weight"],
+                self.w[f"blk.{i}.ffn_up.weight"],
+            ], dim=0))
+
     def _w(self, name: str) -> torch.Tensor:
         return self.w[name]
+
+    def _rmsnorm(self, x: torch.Tensor, weight: torch.Tensor, eps: float) -> torch.Tensor:
+        # fp32 reduction for stability, cast back to fp16
+        rstd = torch.rsqrt(x.float().pow(2).mean(-1, keepdim=True) + eps)
+        return (x.float() * rstd * weight.float()).to(x.dtype)
 
     @torch.inference_mode()
     def forward(self, token_ids: torch.Tensor, positions: torch.Tensor,
@@ -74,12 +89,11 @@ class Transformer:
         (k, v) with shape (n_kv_head, cache_len, head_dim).
         """
         cfg = self.cfg
-        L = token_ids.shape[0]
-        x = self.embed[token_ids]  # (L, hidden)
+        x = self.embed[token_ids]  # (L, hidden), fp16
 
         for i in range(cfg.n_layers):
             x, cache[i] = self._layer(i, x, positions, cache[i])
-        x = x * torch.rsqrt(x.pow(2).mean(-1, keepdim=True) + cfg.eps) * self._w("output_norm.weight")
+        x = self._rmsnorm(x, self._w("output_norm.weight"), cfg.eps)
         logits = x[-1] @ self._w("output.weight").T  # (vocab,)
         return logits
 
@@ -88,50 +102,49 @@ class Transformer:
         cfg = self.cfg
         L = x.shape[0]
         # attention norm
-        h = x * torch.rsqrt(x.pow(2).mean(-1, keepdim=True) + cfg.eps) * self._w(f"blk.{i}.attn_norm.weight")
+        h = self._rmsnorm(x, self._w(f"blk.{i}.attn_norm.weight"), cfg.eps)
 
-        q = h @ self._w(f"blk.{i}.attn_q.weight").T + self._w(f"blk.{i}.attn_q.bias")  # (L, hidden)
-        k = h @ self._w(f"blk.{i}.attn_k.weight").T + self._w(f"blk.{i}.attn_k.bias")  # (L, n_kv*head_dim)
-        v = h @ self._w(f"blk.{i}.attn_v.weight").T + self._w(f"blk.{i}.attn_v.bias")
+        qkv = h @ self.qkv_w[i].T + self.qkv_b[i]  # (L, n_head*hd + 2*n_kv*hd)
+        q, k, v = qkv.split([cfg.hidden, cfg.n_kv_head * cfg.head_dim, cfg.n_kv_head * cfg.head_dim], dim=-1)
         q = q.view(L, cfg.n_head, cfg.head_dim)
         k = k.view(L, cfg.n_kv_head, cfg.head_dim)
         v = v.view(L, cfg.n_kv_head, cfg.head_dim)
 
-        # rotary embeddings (rotate half)
+        # rotary embeddings (rotate-half)
         q, k = self._rope(q, positions), self._rope(k, positions)
 
-        # append to cache and read back the full sequence (cache stores (n_kv, S, hd))
+        # append to cache (stores (n_kv, S, hd))
         k_full = torch.cat([cache[0], k.transpose(0, 1)], dim=1)
         v_full = torch.cat([cache[1], v.transpose(0, 1)], dim=1)
         new_cache = (k_full, v_full)
 
-        # GQA: broadcast kv heads to query heads
-        n_rep = cfg.n_head // cfg.n_kv_head
-        k_rep = k_full.repeat_interleave(n_rep, dim=0)   # (n_head, S, hd)
-        v_rep = v_full.repeat_interleave(n_rep, dim=0)
-
-        # scaled dot-product attention with causal mask
-        scores = torch.einsum("qhd,hkd->hqk", q, k_rep) / (cfg.head_dim ** 0.5)
+        # GQA attention via fused SDPA (flash attention on Blackwell, handles GQA
+        # natively — no repeat_interleave, one kernel instead of einsum+softmax).
         S = k_full.shape[1]
         causal = positions[:, None] >= torch.arange(S, device=self.device)[None, :]
-        scores = scores.masked_fill(~causal, float("-inf"))
-        attn = F.softmax(scores.float(), dim=-1)          # (n_head, L, S)
-        out = torch.einsum("hqk,hkd->qhd", attn, v_rep)   # (L, n_head, hd)
+        out = F.scaled_dot_product_attention(
+            q.transpose(0, 1).unsqueeze(0),   # (1, n_head, L, hd)
+            k_full.unsqueeze(0),              # (1, n_kv, S, hd)
+            v_full.unsqueeze(0),              # (1, n_kv, S, hd)
+            attn_mask=causal,
+            enable_gqa=True,
+        )
+        out = out.squeeze(0).transpose(0, 1)  # (L, n_head, hd)
         out = out.reshape(L, cfg.hidden) @ self._w(f"blk.{i}.attn_output.weight").T
 
         x = x + out
 
         # SwiGLU MLP
-        h = x * torch.rsqrt(x.pow(2).mean(-1, keepdim=True) + cfg.eps) * self._w(f"blk.{i}.ffn_norm.weight")
-        gate = _silu(h @ self._w(f"blk.{i}.ffn_gate.weight").T)
-        up = h @ self._w(f"blk.{i}.ffn_up.weight").T
+        h = self._rmsnorm(x, self._w(f"blk.{i}.ffn_norm.weight"), cfg.eps)
+        gate_up = h @ self.gu_w[i].T                      # (L, 2*ffn_dim)
+        gate, up = gate_up.split([cfg.ffn_dim, cfg.ffn_dim], dim=-1)
+        gate = _silu(gate)
         x = x + (gate * up) @ self._w(f"blk.{i}.ffn_down.weight").T
 
         return x, new_cache
 
     def _rope(self, x: torch.Tensor, positions: torch.Tensor) -> torch.Tensor:
         # Qwen2 uses "rotate-half" RoPE: rotate the pair (x[i], x[i+d/2]) by theta_i.
-        # (HF: q_embed = q*cos + rotate_half(q)*sin, rotate_half(q) = [-x2, x1])
         c = self.cos[positions]  # (L, hd/2)
         s = self.sin[positions]
         x1, x2 = x[..., : x.shape[-1] // 2], x[..., x.shape[-1] // 2:]
