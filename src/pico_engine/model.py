@@ -243,12 +243,12 @@ class Transformer:
     def _moe_ffn(self, i, x):
         cfg = self.cfg
         h = self._rmsnorm_cpu(x, self._w(f"blk.{i}.ffn_norm.weight"), cfg.eps)
-        # router: softmax over all experts -> top-k -> normalize
+        # router: softmax over all experts -> top-k. Qwen1.5-MoE has norm_topk_prob=False,
+        # so the raw top-k softmax weights are used (no re-normalization).
         gate_inp = self._w(f"blk.{i}.ffn_gate_inp.weight")  # (num_experts, hidden)
         router_logits = h @ gate_inp.T
         routing = torch.softmax(router_logits, dim=-1)
         topk_w, topk_idx = torch.topk(routing, cfg.top_k)
-        topk_w = topk_w / topk_w.sum()
         # sparse experts
         ge, ue, de = (self.quant["experts"][i][k] for k in ("gate", "up", "down"))
         y = torch.zeros(cfg.hidden, dtype=torch.float32)
