@@ -66,7 +66,14 @@ GPU, was the bottleneck. The measured progression:
 | preallocate KV cache + hoist RoPE gather | 53.0 |
 | Q8_0/Q5_0 quantized matmuls + fused norm/rope/bias | 57 |
 | Q6_K/Q4_K quantized ffn_down | 61.5 |
-| **CUDA-graph decode loop** | **149.0** |
+| CUDA-graph decode loop | **149.0** |
+
+**Prefill** is fp16 (tensor cores + flash attention via `torch.autocast`); the
+decode path stays fp32 for the CUDA-graph capture. On a 277-token prompt,
+prefill is **37.4 ms (7401 tok/s)** vs llama.cpp's **358 ms (773 tok/s)** —
+~9.6× faster — and 1.58× faster than our own fp32 prefill (54 ms). (llama.cpp's
+prefill number reflects a prebuilt wheel without flash attention; take the exact
+ratio with that caveat.)
 
 Two hypotheses were tested and **rejected**, both measured:
 
@@ -129,14 +136,16 @@ python -m pico_engine <model.gguf> --prompt "Hello" --max-tokens 64
   ~200-launch overhead but still runs ~200 kernels; a single fused
   RMSNorm→QKV→RoPE→attention→SwiGLU→residual kernel per layer would cut the
   GPU-side work too (mostly prefill).
-- **fp16/bf16 compute** — attention and the GEMVs still accumulate in fp32;
-  tensor cores would speed up long-sequence prefill more than decode.
+- **fp16 decode** — prefill is already fp16; the decode GEMVs + attention still
+  accumulate in fp32 (no tensor cores on the M=1 path). Quantized fp16 decode
+  could close the remaining decode gap to a hand-tuned kernel.
 - **More architectures** — the loader/forward is Qwen2/LLaMA-shaped; MoE
   (Qwen2.5-MoE) or Mamba would stress the design.
 
 ## Honest limits
 
-- fp32 compute (slow, exact). No tensor cores in the attention path.
+- fp32 decode compute (the quantized GEMVs + attention accumulate in fp32, no
+  tensor cores); prefill is fp16.
 - Decode throughput is a CUDA-graph capture; prefill is still eager.
 - Single architecture (Qwen2/LLaMA-style) — not a general GGUF runner.
 - No chat template yet; raw completion prompts only.
