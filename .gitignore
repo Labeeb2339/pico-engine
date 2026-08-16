@@ -1,0 +1,14 @@
+# model weights (GGUF files) — not tracked
+models/
+*.gguf
+
+# local reference sources
+.ref/
+
+# test/scratch artifacts
+.pytest-tmp/
+__pycache__/
+*.pyc
+.venv/
+smoke.py
+bench_output.txt

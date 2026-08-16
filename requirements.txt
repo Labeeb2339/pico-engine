@@ -1,0 +1,6 @@
+torch>=2.4
+numpy>=1.24
+regex>=2023.0
+
+# optional: only for the benchmark comparison against llama.cpp
+llama-cpp-python>=0.3
