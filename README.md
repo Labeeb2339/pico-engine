@@ -141,12 +141,20 @@ python -m pico_engine <model.gguf> --prompt "Hello" --max-tokens 64
 
 ## What I would do next
 
-- **fp16 decode** — *tested, rejected (measured)*. The quantized GEMVs already
-  dequantize to ≤fp16 precision (Q8_0 = 1 byte/elem, Q5_0/Q6_K/Q4_K ≈ 0.7–0.8),
-  so fp16 would *double* the output projection's bytes and slow it down; the only
-  fp32 matmuls (QKV + o-proj) are ~3% of decode time, and fp16 saves ~0.3% total.
-- **Fuse the whole layer into one Triton kernel** — the remaining kernel-overhead
-  lever (the elementwise ops are ~60% of per-layer GPU time).
+Both remaining performance levers were tested and **rejected** (measured on the
+post-CUDA-graph path, where decode is no longer launch-bound):
+
+- **fp16 decode** — the quantized GEMVs already dequantize to ≤fp16 precision
+  (Q8_0 = 1 byte/elem, Q5_0/Q6_K/Q4_K ≈ 0.7–0.8), so fp16 would *double* the
+  output projection's bytes and slow it down; the only fp32 matmuls are ~3% of
+  decode time, so fp16 saves ~0.3% total.
+- **Full-layer fusion** — ~14% *slower* (152.7 → 131.9 tok/s). The CUDA graph
+  already collapsed the ~200 launches/token, so fusing the elementwise ops
+  (silu, output-norm) into the memory-bound GEMVs just adds compute to their
+  critical path without saving any launches.
+
+The remaining genuine direction is architectural:
+
 - **More architectures** — the loader/forward is Qwen2/LLaMA-shaped; MoE
   (Qwen2.5-MoE) or Mamba would stress the design.
 
