@@ -19,7 +19,7 @@ from dataclasses import dataclass
 import torch
 import torch.nn.functional as F
 
-from .kernels import rmsnorm, rope, silu_mul, decode_attn, q8_0_gemv, q5_0_gemv, q5_0_gemv_norm
+from .kernels import rmsnorm, rope, silu_mul, decode_attn, q8_0_gemv, q5_0_gemv, q5_0_gemv_norm, q6_k_gemv, q4_k_gemv
 
 
 @dataclass
@@ -157,6 +157,16 @@ class Transformer:
             h = rmsnorm(x, self._w(f"blk.{i}.ffn_norm.weight"), cfg.eps)
             gate_up = h @ self.gu_w[i].T                      # (L, 2*ffn_dim)
         act = silu_mul(gate_up, cfg.ffn_dim)              # (L, ffn_dim) = silu(gate)*up
+        if L == 1 and "down" in self.quant:
+            entry = self.quant["down"][i]
+            if entry is not None:
+                if entry[0] == "q6":
+                    _, qs, dsc = entry
+                    x = q6_k_gemv(act[0], qs, dsc, residual=x[0]).unsqueeze(0)
+                else:
+                    _, qs, sc, mn = entry
+                    x = q4_k_gemv(act[0], qs, sc, mn, residual=x[0]).unsqueeze(0)
+                return x
         x = torch.addmm(x, act, self._w(f"blk.{i}.ffn_down.weight").T)
 
         return x

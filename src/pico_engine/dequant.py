@@ -104,6 +104,70 @@ def unpack_q8_0(blocks: np.ndarray, n: int) -> tuple[np.ndarray, np.ndarray]:
     return qs.reshape(-1), d
 
 
+def unpack_q6_k(blocks: np.ndarray, n: int) -> tuple[np.ndarray, np.ndarray]:
+    """Unpack Q6_K into (q int8 -32..31, dsc fp32 per-16) for the GEMV kernel.
+
+    Each 256-element super-block stores ql(128)+qh(64)+scales(16 int8)+d(fp16).
+    Per 16-element sub-block the value is ``(6bit - 32) * d * scale``; the
+    kernel reads the pre-applied combined scale ``dsc = d * scale`` so it only
+    does ``sum(dsc * q * x)``.
+    """
+    nb = n // 256
+    blocks = blocks[: nb * 210].reshape(nb, 210)
+    ql = blocks[:, 0:128]                                   # (nb, 128)
+    qh = blocks[:, 128:192]                                 # (nb, 64)
+    sc = blocks[:, 192:208].view(np.int8).astype(np.float32)  # (nb, 16)
+    d = blocks[:, 208:210].view(np.float16).astype(np.float32).reshape(nb, 1)
+
+    q = np.empty((nb, 256), dtype=np.int8)
+    for h in range(2):
+        ql_h = ql[:, h * 64:(h + 1) * 64]                   # (nb, 64)
+        qh_h = qh[:, h * 32:(h + 1) * 32]                   # (nb, 32)
+        lo = (ql_h & 0xF).astype(np.int16)
+        hi = (ql_h >> 4).astype(np.int16)
+        b0 = (qh_h & 3).astype(np.int16)
+        b1 = ((qh_h >> 2) & 3).astype(np.int16)
+        b2 = ((qh_h >> 4) & 3).astype(np.int16)
+        b3 = ((qh_h >> 6) & 3).astype(np.int16)
+        q[:, h * 128 + 0:h * 128 + 32] = (lo[:, :32] | (b0 << 4)) - 32
+        q[:, h * 128 + 32:h * 128 + 64] = (lo[:, 32:] | (b1 << 4)) - 32
+        q[:, h * 128 + 64:h * 128 + 96] = (hi[:, :32] | (b2 << 4)) - 32
+        q[:, h * 128 + 96:h * 128 + 128] = (hi[:, 32:] | (b3 << 4)) - 32
+    dsc = (sc * d).astype(np.float32)                       # (nb, 16)
+    return q.reshape(-1), dsc.reshape(-1)
+
+
+def unpack_q4_k(blocks: np.ndarray, n: int) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Unpack Q4_K into (q int8 0..15, sc fp32 per-32, mn fp32 per-32).
+
+    Each 256-element super-block has 8 sub-blocks of 32 elements; sub-block j
+    stores a 4-bit nibble plus a 6-bit scale ``sc[j]`` and 6-bit min ``mn[j]``:
+    ``value = nibble * sc[j] * d - mn[j] * dmin``. The kernel applies the
+    combined ``sc*d`` and ``mn*dmin`` so it only does ``sum(sc*q*x - mn*x)``.
+    """
+    nb = n // 256
+    blocks = blocks[: nb * 144].reshape(nb, 144)
+    d = blocks[:, :2].view(np.float16).astype(np.float32).reshape(nb)
+    dmin = blocks[:, 2:4].view(np.float16).astype(np.float32).reshape(nb)
+    scales = blocks[:, 4:16].astype(np.int32)               # (nb, 12)
+    qs = blocks[:, 16:144]                                  # (nb, 128)
+
+    q = np.empty((nb, 256), dtype=np.int8)
+    sc_out = np.empty((nb, 8), dtype=np.float32)
+    mn_out = np.empty((nb, 8), dtype=np.float32)
+    for k in range(4):
+        qseg = qs[:, k * 32:(k + 1) * 32]
+        lo = (qseg & 0xF).astype(np.int8)
+        hi = (qseg >> 4).astype(np.int8)
+        for which, nib in ((0, lo), (1, hi)):
+            j = 2 * k + which
+            sc6, mn6 = _scale_min_k4(j, scales)
+            q[:, j * 32:(j + 1) * 32] = nib
+            sc_out[:, j] = sc6 * d
+            mn_out[:, j] = mn6 * dmin
+    return q.reshape(-1), sc_out.reshape(-1), mn_out.reshape(-1)
+
+
 def _scale_min_k4(j: int, scales: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
     """Unpack the j-th 6-bit scale and 6-bit min from a 12-byte scales array."""
     if j < 4:

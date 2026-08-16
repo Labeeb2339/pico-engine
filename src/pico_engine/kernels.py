@@ -258,3 +258,81 @@ def q5_0_gemv_norm(x: torch.Tensor, weight: torch.Tensor, qs: torch.Tensor, d: t
     _q5_0_gemv_norm_fwd[(triton.cdiv(N, 128),)](
         x, weight, qs, d, out, K, NB, eps, BLOCK_N=128, BLOCK_K=triton.next_power_of_2(K), num_warps=4)
     return out
+
+
+@triton.jit
+def _q6_k_gemv_fwd(x_ptr, qs_ptr, dsc_ptr, res_ptr, out_ptr, K, NS,
+                   BLOCK_N: tl.constexpr):
+    # out[n] = res[n] + sum_s dsc[n,s] * sum_{k in s} q[n, s*16+k] * x[s*16+k]
+    # q: int8 (N, K); dsc: fp32 (N, NS=K/16), one combined scale per 16 elements.
+    pid = tl.program_id(0)
+    offs_n = pid * BLOCK_N + tl.arange(0, BLOCK_N)
+    acc = tl.load(res_ptr + offs_n).to(tl.float32)
+    for s in range(NS):
+        offs_k = tl.arange(0, 16)
+        xv = tl.load(x_ptr + s * 16 + offs_k).to(tl.float32)
+        qs = tl.load(qs_ptr + offs_n[:, None] * K + (s * 16 + offs_k)[None, :]).to(tl.float32)
+        dsc = tl.load(dsc_ptr + offs_n * NS + s)
+        acc += dsc * tl.sum(qs * xv[None, :], axis=1)
+    tl.store(out_ptr + offs_n, acc)
+
+
+def q6_k_gemv(x: torch.Tensor, qs: torch.Tensor, dsc: torch.Tensor,
+              residual: torch.Tensor | None = None) -> torch.Tensor:
+    """Q6_K quantized GEMV: out = res + x @ W.T, W = (q int8 (N,K), dsc fp32 (N,K/16))."""
+    x = x.contiguous().float()
+    qs = qs.contiguous()
+    dsc = dsc.contiguous()
+    K = x.numel()
+    N = qs.shape[0]
+    NS = K // 16
+    if residual is None:
+        residual = torch.zeros(N, device=x.device, dtype=torch.float32)
+    else:
+        residual = residual.contiguous().float()
+    out = torch.empty(N, device=x.device, dtype=torch.float32)
+    BLOCK_N = 128
+    _q6_k_gemv_fwd[(triton.cdiv(N, BLOCK_N),)](x, qs, dsc, residual, out, K, NS,
+                                                BLOCK_N=BLOCK_N, num_warps=4)
+    return out
+
+
+@triton.jit
+def _q4_k_gemv_fwd(x_ptr, qs_ptr, sc_ptr, mn_ptr, res_ptr, out_ptr, K, NB,
+                   BLOCK_N: tl.constexpr):
+    # out[n] = res[n] + sum_b (sc[n,b] * sum_k q[n,k]*x[k] - mn[n,b] * sum_k x[k])
+    # q: int8 (N, K) nibbles 0..15; sc/mn: fp32 (N, NB=K/32).
+    pid = tl.program_id(0)
+    offs_n = pid * BLOCK_N + tl.arange(0, BLOCK_N)
+    acc = tl.load(res_ptr + offs_n).to(tl.float32)
+    for b in range(NB):
+        offs_k = tl.arange(0, 32)
+        xv = tl.load(x_ptr + b * 32 + offs_k).to(tl.float32)
+        qs = tl.load(qs_ptr + offs_n[:, None] * K + (b * 32 + offs_k)[None, :]).to(tl.float32)
+        sc = tl.load(sc_ptr + offs_n * NB + b)
+        mn = tl.load(mn_ptr + offs_n * NB + b)
+        sx = tl.sum(xv, axis=0)
+        dot = tl.sum(qs * xv[None, :], axis=1)
+        acc += sc * dot - mn * sx
+    tl.store(out_ptr + offs_n, acc)
+
+
+def q4_k_gemv(x: torch.Tensor, qs: torch.Tensor, sc: torch.Tensor, mn: torch.Tensor,
+              residual: torch.Tensor | None = None) -> torch.Tensor:
+    """Q4_K quantized GEMV: out = res + x @ W.T, W = (q int8 (N,K), sc/mn fp32 (N,K/32))."""
+    x = x.contiguous().float()
+    qs = qs.contiguous()
+    sc = sc.contiguous()
+    mn = mn.contiguous()
+    K = x.numel()
+    N = qs.shape[0]
+    NB = K // 32
+    if residual is None:
+        residual = torch.zeros(N, device=x.device, dtype=torch.float32)
+    else:
+        residual = residual.contiguous().float()
+    out = torch.empty(N, device=x.device, dtype=torch.float32)
+    BLOCK_N = 128
+    _q4_k_gemv_fwd[(triton.cdiv(N, BLOCK_N),)](x, qs, sc, mn, residual, out, K, NB,
+                                                BLOCK_N=BLOCK_N, num_warps=4)
+    return out

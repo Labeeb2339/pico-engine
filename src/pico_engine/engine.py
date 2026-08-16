@@ -6,7 +6,7 @@ from pathlib import Path
 
 import torch
 
-from .dequant import dequantize, unpack_q5_0, unpack_q8_0
+from .dequant import dequantize, unpack_q5_0, unpack_q8_0, unpack_q6_k, unpack_q4_k
 from .gguf import load as load_gguf
 from .model import ModelConfig, Transformer
 from .sampler import sample as sample_token
@@ -92,11 +92,13 @@ class Engine:
 
             # gate + up (Q5_0) fused per layer -> (gu_q5, gu_d) lists
             gu_q5, gu_d = [], []
+            gu_ok = True
             for i in range(self.cfg.n_layers):
                 g = by_name.get(f"blk.{i}.ffn_gate.weight")
                 u = by_name.get(f"blk.{i}.ffn_up.weight")
                 if g is None or u is None or g.ggml_type != 6 or u.ggml_type != 6:
-                    return quant  # not Q5_0; keep fp32 fallback
+                    gu_ok = False
+                    break
                 Ng, K = g.shape[::-1]
                 Nu, _ = u.shape[::-1]
                 qg, dg = unpack_q5_0(np.frombuffer(raw_of(g), dtype=np.uint8), Ng * K)
@@ -105,8 +107,33 @@ class Engine:
                 d = torch.from_numpy(np.concatenate([dg, du])).to(self.device).view(Ng + Nu, K // 32)
                 gu_q5.append(q5)
                 gu_d.append(d)
-            quant["gu"] = (gu_q5, gu_d)
-        return quant
+            if gu_ok:
+                quant["gu"] = (gu_q5, gu_d)
+
+            # ffn_down (Q6_K or Q4_K per layer) -> per-layer entries ("q6"/"q4"/None)
+            down = []
+            for i in range(self.cfg.n_layers):
+                t = by_name.get(f"blk.{i}.ffn_down.weight")
+                if t is None:
+                    down.append(None)
+                    continue
+                N, K = t.shape[::-1]
+                raw = np.frombuffer(raw_of(t), dtype=np.uint8)
+                if t.ggml_type == 14:  # Q6_K
+                    qs, dsc = unpack_q6_k(raw, N * K)
+                    down.append(("q6",
+                                 torch.from_numpy(qs.reshape(N, K)).to(self.device),
+                                 torch.from_numpy(dsc.reshape(N, K // 16)).to(self.device)))
+                elif t.ggml_type == 12:  # Q4_K
+                    qs, sc, mn = unpack_q4_k(raw, N * K)
+                    down.append(("q4",
+                                 torch.from_numpy(qs.reshape(N, K)).to(self.device),
+                                 torch.from_numpy(sc.reshape(N, K // 32)).to(self.device),
+                                 torch.from_numpy(mn.reshape(N, K // 32)).to(self.device)))
+                else:
+                    down.append(None)
+            quant["down"] = down
+            return quant
 
     @torch.inference_mode()
     def generate(self, prompt: str, max_tokens: int = 64, temperature: float = 0.7,
