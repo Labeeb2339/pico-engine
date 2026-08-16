@@ -21,6 +21,7 @@ import torch
 import torch.nn.functional as F
 
 from .kernels import rmsnorm, rope, silu_mul, decode_attn, q8_0_gemv, q5_0_gemv, q5_0_gemv_norm, q6_k_gemv, q4_k_gemv
+from .scan import selective_scan
 
 
 @dataclass
@@ -139,6 +140,8 @@ class Transformer:
         if cfg.is_moe:
             return self._forward_moe(token_ids, positions, cache)
         if cfg.is_mamba:
+            if token_ids.shape[0] > 1:
+                return self._forward_mamba_prefill(token_ids, cache)
             return self._forward_mamba(token_ids, positions, cache)
         L = token_ids.shape[0]
         # Prefill (L>1) runs the batched matmuls + SDPA in fp16 (tensor cores +
@@ -414,3 +417,67 @@ class Transformer:
             x_last = x_t
         h = self._rmsnorm_cpu(x_last, self._w("output_norm.weight"), cfg.eps)
         return h @ self.embed.T  # tied embedding -> logits (vocab,)
+
+    # ---- parallel Mamba prefill: batched matmuls + associative-scan SSM ----
+
+    def _causal_conv1d(self, x, conv_w, conv_b):
+        """Causal depthwise conv1d over the full sequence (parallel, F.conv1d)."""
+        # x: (L, d_inner), conv_w: (d_inner, d_conv), conv_b: (d_inner,)
+        d_inner, d_conv = conv_w.shape
+        x = x.transpose(0, 1).unsqueeze(0)          # (1, d_inner, L)
+        x = F.conv1d(x, conv_w.unsqueeze(1), conv_b, padding=d_conv - 1, groups=d_inner)
+        x = x[..., :-(d_conv - 1)]                   # drop the future-leaking tail
+        return x.squeeze(0).transpose(0, 1)          # (L, d_inner)
+
+    def _ssm_prefill(self, i, x_act, z, ssm_state):
+        """Parallel selective scan for the whole sequence, updating ssm_state."""
+        cfg = self.cfg
+        p = f"blk.{i}"
+        x_proj = self._w(f"{p}.ssm_x.weight")
+        dt_proj = self._w(f"{p}.ssm_dt.weight")
+        dt_bias = self._w(f"{p}.ssm_dt.bias")
+        A = self._A[i]                                # (d_inner, d_state) = -exp(A_log)
+        D = self._w(f"{p}.ssm_d")                     # (d_inner,)
+        L = x_act.shape[0]
+        x_dbl = x_act @ x_proj.T                      # (L, dt_rank + 2*d_state)
+        dt_raw = x_dbl[:, :cfg.dt_rank]
+        B = x_dbl[:, cfg.dt_rank:cfg.dt_rank + cfg.d_state]
+        C = x_dbl[:, cfg.dt_rank + cfg.d_state:]
+        dt = F.softplus(dt_raw @ dt_proj.T + dt_bias)  # (L, d_inner)
+        a = torch.exp(dt[:, :, None] * A[None])       # (L, d_inner, d_state)
+        b = dt[:, :, None] * B[:, None, :] * x_act[:, :, None]
+        c = C[:, None, :].expand(L, cfg.d_inner, cfg.d_state)
+        y, h_last = selective_scan(
+            a.permute(1, 0, 2).contiguous(),
+            b.permute(1, 0, 2).contiguous(),
+            c.permute(1, 0, 2).contiguous(),
+            x_act.t().contiguous(),
+            D,
+        )
+        ssm_state.copy_(h_last)
+        return y.t()                                  # (L, d_inner)
+
+    def _mamba_layer_prefill(self, i, x, cache_i):
+        cfg = self.cfg
+        conv_state, ssm_state = cache_i
+        p = f"blk.{i}"
+        h = self._rmsnorm_cpu(x, self._w(f"{p}.attn_norm.weight"), cfg.eps)
+        xz = h @ self._w(f"{p}.ssm_in.weight").T      # (L, 2*d_inner)
+        x_ssm = xz[:, :cfg.d_inner]
+        z = xz[:, cfg.d_inner:]
+        x_conv = self._causal_conv1d(
+            x_ssm, self._w(f"{p}.ssm_conv1d.weight"), self._w(f"{p}.ssm_conv1d.bias"))
+        conv_state.copy_(x_ssm[-(cfg.d_conv - 1):].t().contiguous())
+        x_act = F.silu(x_conv)
+        y = self._ssm_prefill(i, x_act, z, ssm_state)
+        y = y * F.silu(z)
+        out = y @ self._w(f"{p}.ssm_out.weight").T    # (L, d_model)
+        return x + out
+
+    def _forward_mamba_prefill(self, token_ids, cache):
+        cfg = self.cfg
+        x = self.embed[token_ids]                     # (L, d_model)
+        for i in range(cfg.n_layers):
+            x = self._mamba_layer_prefill(i, x, cache[i])
+        h = self._rmsnorm_cpu(x[-1], self._w("output_norm.weight"), cfg.eps)
+        return h @ self.embed.T                       # tied embedding -> logits (vocab,)
