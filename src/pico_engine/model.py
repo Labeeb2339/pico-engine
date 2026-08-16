@@ -40,10 +40,20 @@ class ModelConfig:
     top_k: int = 0
     expert_ffn_dim: int = 0
     shared_ffn_dim: int = 0
+    # Mamba / SSM (defaults 0 => not mamba)
+    arch: str = ""
+    d_inner: int = 0
+    d_state: int = 0
+    d_conv: int = 0
+    dt_rank: int = 0
 
     @property
     def is_moe(self) -> bool:
         return self.num_experts > 0
+
+    @property
+    def is_mamba(self) -> bool:
+        return self.arch == "mamba"
 
 
 class Transformer:
@@ -58,16 +68,18 @@ class Transformer:
         self.embed = quant["token_embd"] if cfg.is_moe else weights["token_embd.weight"]
 
         # rotary cos/sin tables — (context_len, head_dim//2), on the embedding device
-        emb_dev = self.embed.device
-        inv_freq = 1.0 / (cfg.rope_base ** (torch.arange(0, cfg.head_dim, 2, device=emb_dev) / cfg.head_dim))
-        pos = torch.arange(cfg.context_len, device=emb_dev, dtype=torch.float32)
-        angles = pos[:, None] * inv_freq[None, :]
-        self.cos = angles.cos()
-        self.sin = angles.sin()
+        # (Mamba has no attention/RoPE, so this is skipped.)
+        if not cfg.is_mamba:
+            emb_dev = self.embed.device
+            inv_freq = 1.0 / (cfg.rope_base ** (torch.arange(0, cfg.head_dim, 2, device=emb_dev) / cfg.head_dim))
+            pos = torch.arange(cfg.context_len, device=emb_dev, dtype=torch.float32)
+            angles = pos[:, None] * inv_freq[None, :]
+            self.cos = angles.cos()
+            self.sin = angles.sin()
 
         # Dense-only: fuse the per-layer QKV and gate/up projections into single matmuls.
         self.qkv_w, self.qkv_b, self.gu_w = [], [], []
-        if not cfg.is_moe:
+        if not cfg.is_moe and not cfg.is_mamba:
             for i in range(cfg.n_layers):
                 self.qkv_w.append(torch.cat([
                     self.w[f"blk.{i}.attn_q.weight"],
@@ -83,6 +95,11 @@ class Transformer:
                     self.w[f"blk.{i}.ffn_gate.weight"],
                     self.w[f"blk.{i}.ffn_up.weight"],
                 ], dim=0))
+
+        # Mamba: the GGUF stores `ssm_a` as A = -exp(A_log) already (precomputed),
+        # so the forward uses it directly — no log/exp round-trip.
+        if cfg.is_mamba:
+            self._A = [self._w(f"blk.{i}.ssm_a").float() for i in range(cfg.n_layers)]
 
         # MoE partial offload: move the first n_gpu_layers' weights (int8 + F32) to GPU.
         if cfg.is_moe and n_gpu_layers > 0 and device.type == "cuda":
@@ -121,6 +138,8 @@ class Transformer:
         cfg = self.cfg
         if cfg.is_moe:
             return self._forward_moe(token_ids, positions, cache)
+        if cfg.is_mamba:
+            return self._forward_mamba(token_ids, positions, cache)
         L = token_ids.shape[0]
         # Prefill (L>1) runs the batched matmuls + SDPA in fp16 (tensor cores +
         # flash attention); decode (L=1) stays fp32 so the CUDA-graph capture is
@@ -340,3 +359,58 @@ class Transformer:
         out_dev = self.quant["output"][1].device
         h = self._rmsnorm_cpu(x_last.to(out_dev), self._w("output_norm.weight"), cfg.eps)
         return self._gemv(self.quant["output"], h)
+
+    # ---- Mamba (SSM) forward: causal conv1d + selective scan ----
+
+    def _mamba_ssm(self, i, x, z, ssm_state):
+        """Single-token selective-scan SSM (sequential recurrence, correctness-first)."""
+        cfg = self.cfg
+        p = f"blk.{i}"
+        x_proj_out = x @ self._w(f"{p}.ssm_x.weight").T   # (dt_rank + 2*d_state,)
+        dt_raw = x_proj_out[:cfg.dt_rank]
+        B = x_proj_out[cfg.dt_rank:cfg.dt_rank + cfg.d_state]
+        C = x_proj_out[cfg.dt_rank + cfg.d_state:]
+        dt = self._w(f"{p}.ssm_dt.weight") @ dt_raw + self._w(f"{p}.ssm_dt.bias")
+        dt = F.softplus(dt)
+        A = self._A[i]                                     # (d_inner, d_state) = -exp(A_log)
+        D = self._w(f"{p}.ssm_d")                          # (d_inner,)
+        dA = torch.exp(dt[..., None] * A)                  # (d_inner, d_state)
+        dB = dt[..., None] * B[None, :]                    # (d_inner, d_state)
+        dBx = dB * x[..., None]                            # (d_inner, d_state)
+        new_state = ssm_state * dA + dBx                   # (d_inner, d_state)
+        ssm_state.copy_(new_state)
+        y = (new_state * C[None, :]).sum(-1)               # (d_inner,)
+        y = y + x * D                                       # D skip connection
+        return y * F.silu(z)                                # gated output
+
+    def _mamba_layer(self, i, x, cache_i):
+        cfg = self.cfg
+        conv_state, ssm_state = cache_i
+        p = f"blk.{i}"
+        h = self._rmsnorm_cpu(x, self._w(f"{p}.attn_norm.weight"), cfg.eps)
+        xz = h @ self._w(f"{p}.ssm_in.weight").T           # (2*d_inner,) = [x, z]
+        x_ssm = xz[:cfg.d_inner]
+        z = xz[cfg.d_inner:]
+        # causal depthwise conv1d (single token)
+        conv_w = self._w(f"{p}.ssm_conv1d.weight")         # (d_inner, d_conv)
+        conv_b = self._w(f"{p}.ssm_conv1d.bias")
+        x_new = torch.cat([conv_state, x_ssm.unsqueeze(-1)], dim=-1)  # (d_inner, d_conv)
+        conv_state.copy_(x_new[:, 1:])
+        x_conv = (conv_w * x_new).sum(-1) + conv_b
+        x_act = F.silu(x_conv)
+        y = self._mamba_ssm(i, x_act, z, ssm_state)
+        out = y @ self._w(f"{p}.ssm_out.weight").T         # (d_model,)
+        return x + out
+
+    def _forward_mamba(self, token_ids, positions, cache):
+        cfg = self.cfg
+        x = self.embed[token_ids]  # (L, d_model)
+        L = x.shape[0]
+        x_last = None
+        for t in range(L):
+            x_t = x[t]
+            for i in range(cfg.n_layers):
+                x_t = self._mamba_layer(i, x_t, cache[i])
+            x_last = x_t
+        h = self._rmsnorm_cpu(x_last, self._w("output_norm.weight"), cfg.eps)
+        return h @ self.embed.T  # tied embedding -> logits (vocab,)

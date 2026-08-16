@@ -26,6 +26,8 @@ class Engine:
     def _build_config(self) -> ModelConfig:
         m = self.gguf.metadata
         arch = m["general.architecture"]
+        if arch == "mamba":
+            return self._build_config_mamba(arch, m)
         n_layers = int(m[f"{arch}.block_count"])
         hidden = int(m[f"{arch}.embedding_length"])
         n_head = int(m[f"{arch}.attention.head_count"])
@@ -60,6 +62,21 @@ class Engine:
                            head_dim, ffn_dim, rope_base, eps, context_len,
                            num_experts, top_k, expert_ffn_dim, shared_ffn_dim)
 
+    def _build_config_mamba(self, arch: str, m: dict) -> ModelConfig:
+        n_layers = int(m[f"{arch}.block_count"])
+        hidden = int(m[f"{arch}.embedding_length"])
+        d_inner = int(m[f"{arch}.ssm.inner_size"])
+        eps = float(m[f"{arch}.attention.layer_norm_rms_epsilon"])
+        context_len = int(m[f"{arch}.context_length"])
+        vocab_size = len(m["tokenizer.ggml.tokens"])
+        by_name = {t.name: t for t in self.gguf.tensors}
+        d_state = by_name["blk.0.ssm_a"].shape[0]            # (d_state, d_inner)
+        d_conv = by_name["blk.0.ssm_conv1d.weight"].shape[0]  # (d_conv, d_inner)
+        dt_rank = by_name["blk.0.ssm_dt.weight"].shape[0]     # (dt_rank, d_inner)
+        return ModelConfig(vocab_size, n_layers, hidden, 0, 0, 0, 0, 0.0, eps, context_len,
+                           arch=arch, d_inner=d_inner, d_state=d_state,
+                           d_conv=d_conv, dt_rank=dt_rank)
+
     def _load_weights(self) -> dict[str, torch.Tensor]:
         weights: dict[str, torch.Tensor] = {}
         with open(self.gguf.path, "rb") as f:
@@ -81,6 +98,15 @@ class Engine:
         return weights
 
     def _empty_cache(self, capacity: int) -> list[tuple[torch.Tensor, torch.Tensor]]:
+        if self.cfg.is_mamba:
+            # Mamba state: (conv_state (d_inner, d_conv-1), ssm_state (d_inner, d_state)) per layer.
+            dev = self.model.embed.device
+            caches = []
+            for _ in range(self.cfg.n_layers):
+                conv = torch.zeros(self.cfg.d_inner, self.cfg.d_conv - 1, device=dev)
+                ssm = torch.zeros(self.cfg.d_inner, self.cfg.d_state, device=dev)
+                caches.append((conv, ssm))
+            return caches
         if self.cfg.is_moe:
             # per-layer device: GPU for offloaded layers, embedding device (CPU) for the rest
             caches = []
@@ -97,6 +123,8 @@ class Engine:
     def _prep_quant(self) -> dict:
         if self.cfg.is_moe:
             return self._prep_quant_moe()
+        if self.cfg.is_mamba:
+            return {}  # Mamba-130M is tiny; fp32 weights from _load_weights are fine
         return self._prep_quant_dense()
 
     def _prep_quant_moe(self) -> dict:
