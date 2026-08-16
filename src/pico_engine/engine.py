@@ -156,8 +156,10 @@ class Engine:
                 self._static_logits = self.model.forward(self._static_ids, self._static_pos, cache)
             self._graph = g
             return g
-        except Exception:
+        except Exception as e:
             self._graph = None
+            import warnings
+            warnings.warn(f"CUDA graph capture failed; falling back to eager decode: {e}")
             return None
 
     def _decode_step(self, token: int, pos: int, cache, graph):
@@ -174,7 +176,8 @@ class Engine:
 
     @torch.inference_mode()
     def generate(self, prompt: str, max_tokens: int = 64, temperature: float = 0.7,
-                 top_k: int = 0, top_p: float = 0.9) -> tuple[str, list[int]]:
+                 top_k: int = 0, top_p: float = 0.9,
+                 use_graph: bool = True) -> tuple[str, list[int]]:
         ids = self.tok.encode(prompt)
         if not ids:
             return "", []
@@ -183,8 +186,8 @@ class Engine:
 
         # Capture the decode graph *before* prefill (the capture warmup writes
         # a scratch position into the cache; the prefill below then overwrites
-        # the real positions).
-        graph = self._build_decode_graph(cache) if self.device.type == "cuda" else None
+        # the real positions). ``use_graph=False`` forces the eager path.
+        graph = self._build_decode_graph(cache) if (self.device.type == "cuda" and use_graph) else None
 
         # prefill
         tokens = torch.tensor(ids, device=self.device)
