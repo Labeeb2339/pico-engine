@@ -48,7 +48,7 @@ class ModelConfig:
 
 class Transformer:
     def __init__(self, cfg: ModelConfig, weights: dict[str, torch.Tensor], device: torch.device,
-                 quant: dict | None = None):
+                 quant: dict | None = None, n_gpu_layers: int = 0):
         self.cfg = cfg
         self.device = device
         self.w = weights  # name -> tensor on device
@@ -83,6 +83,26 @@ class Transformer:
                     self.w[f"blk.{i}.ffn_gate.weight"],
                     self.w[f"blk.{i}.ffn_up.weight"],
                 ], dim=0))
+
+        # MoE partial offload: move the first n_gpu_layers' weights (int8 + F32) to GPU.
+        if cfg.is_moe and n_gpu_layers > 0 and device.type == "cuda":
+            def _mv(entry, dev):
+                tag, q, s1, s2 = entry
+                return (tag, q.to(dev), s1.to(dev), None if s2 is None else s2.to(dev))
+
+            for i in range(min(n_gpu_layers, cfg.n_layers)):
+                for name in list(self.w):
+                    if name.startswith(f"blk.{i}."):
+                        self.w[name] = self.w[name].to(device)
+                for nm in ("attn_q", "attn_k", "attn_v", "attn_output"):
+                    self.quant["attn"][i][nm] = _mv(self.quant["attn"][i][nm], device)
+                for k in ("gate", "up", "down"):
+                    self.quant["experts"][i][k] = _mv(self.quant["experts"][i][k], device)
+                for nm in ("ffn_gate_shexp", "ffn_up_shexp", "ffn_down_shexp"):
+                    self.quant["shared"][i][nm] = _mv(self.quant["shared"][i][nm], device)
+
+    def _layer_dev(self, i: int) -> torch.device:
+        return self.quant["attn"][i]["attn_q"][1].device
 
     def _w(self, name: str) -> torch.Tensor:
         return self.w[name]
@@ -198,13 +218,29 @@ class Transformer:
 
     @staticmethod
     def _gemv(entry, x, bias=None, residual=None):
-        """Vectorized CPU GEMV against a quantized 2D weight.
+        """Device-aware quantized GEMV.
 
-        entry = (tag, q, s1, s2): q int8 (N, K), s1/s2 fp32 scales. Reshapes q to
-        (N, nb, block) and reduces the block axis in one vectorized op — no Python
-        per-block loop, no full-fp32 materialization beyond one transient (N, nb, block).
+        entry = (tag, q, s1, s2): q int8 (N, K), s1/s2 fp32 scales. On CUDA it
+        dispatches to the fused Triton GEMV kernels; on CPU it uses a vectorized
+        reduce (no per-block Python loop, no full-fp32 materialization).
         """
         tag, q, s1, s2 = entry
+        if q.device.type == "cuda":
+            if tag == "q4":
+                out = q4_k_gemv(x, q, s1, s2, residual)
+            elif tag == "q6":
+                out = q6_k_gemv(x, q, s1, residual)
+            elif tag == "q8":
+                out = q8_0_gemv(x, q, s1)
+                if residual is not None:
+                    out = out + residual
+            else:  # q5
+                out = q5_0_gemv(x, q, s1)
+                if residual is not None:
+                    out = out + residual
+            if bias is not None:
+                out = out + bias
+            return out
         x = x.float()
         N, K = q.shape
         block = 16 if tag == "q6" else 32
@@ -252,7 +288,7 @@ class Transformer:
         topk_w, topk_idx = torch.topk(routing, cfg.top_k)
         # sparse experts
         ge, ue, de = (self.quant["experts"][i][k] for k in ("gate", "up", "down"))
-        y = torch.zeros(cfg.hidden, dtype=torch.float32)
+        y = torch.zeros(cfg.hidden, dtype=torch.float32, device=x.device)
         for j in range(cfg.top_k):
             e = int(topk_idx[j])
             act = torch.nn.functional.silu(self._gemv_expert(ge, e, h)) * self._gemv_expert(ue, e, h)
@@ -273,8 +309,10 @@ class Transformer:
         q = self._gemv(a["attn_q"], h, bias=self._w(f"blk.{i}.attn_q.bias")).view(cfg.n_head, hd)
         k = self._gemv(a["attn_k"], h, bias=self._w(f"blk.{i}.attn_k.bias")).view(cfg.n_kv_head, hd)
         v = self._gemv(a["attn_v"], h, bias=self._w(f"blk.{i}.attn_v.bias")).view(cfg.n_kv_head, hd)
-        q = self._rope_cpu(q, self.cos[pos], self.sin[pos])
-        k = self._rope_cpu(k, self.cos[pos], self.sin[pos])
+        cos = self.cos[pos].to(x.device)
+        sin = self.sin[pos].to(x.device)
+        q = self._rope_cpu(q, cos, sin)
+        k = self._rope_cpu(k, cos, sin)
         k_buf[:, pos] = k
         v_buf[:, pos] = v
         S = pos + 1
@@ -286,14 +324,19 @@ class Transformer:
         return self._moe_ffn(i, x)
 
     def _forward_moe(self, token_ids, positions, cache):
-        """Single-token-at-a-time MoE forward (CPU, correctness-first)."""
+        """Single-token-at-a-time MoE forward, dispatching each layer to its device."""
         cfg = self.cfg
-        x = self.embed[token_ids]  # (L, hidden)
+        x = self.embed[token_ids]  # (L, hidden), on the embedding device (CPU)
         L = x.shape[0]
+        x_last = None
         for t in range(L):
             x_t = x[t]
             for i in range(cfg.n_layers):
+                dev = self._layer_dev(i)
+                if x_t.device != dev:
+                    x_t = x_t.to(dev)
                 x_t = self._moe_layer(i, x_t, int(positions[t]), cache[i][0], cache[i][1])
-            x[t] = x_t
-        h = self._rmsnorm_cpu(x[-1], self._w("output_norm.weight"), cfg.eps)
+            x_last = x_t
+        out_dev = self.quant["output"][1].device
+        h = self._rmsnorm_cpu(x_last.to(out_dev), self._w("output_norm.weight"), cfg.eps)
         return self._gemv(self.quant["output"], h)

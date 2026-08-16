@@ -14,13 +14,13 @@ from .tokenizer import from_gguf as tokenizer_from_gguf
 
 
 class Engine:
-    def __init__(self, gguf_path: str | Path, device: str = "cuda"):
+    def __init__(self, gguf_path: str | Path, device: str = "cuda", n_gpu_layers: int = 0):
         self.device = torch.device(device)
         self.gguf = load_gguf(gguf_path)
         self.cfg = self._build_config()
         self.weights = self._load_weights()
         self.quant = self._prep_quant()
-        self.model = Transformer(self.cfg, self.weights, self.device, self.quant)
+        self.model = Transformer(self.cfg, self.weights, self.device, self.quant, n_gpu_layers)
         self.tok = tokenizer_from_gguf(self.gguf.metadata)
 
     def _build_config(self) -> ModelConfig:
@@ -81,7 +81,16 @@ class Engine:
         return weights
 
     def _empty_cache(self, capacity: int) -> list[tuple[torch.Tensor, torch.Tensor]]:
-        dev = self.model.embed.device if self.cfg.is_moe else self.device
+        if self.cfg.is_moe:
+            # per-layer device: GPU for offloaded layers, embedding device (CPU) for the rest
+            caches = []
+            for i in range(self.cfg.n_layers):
+                dev = self.model._layer_dev(i)
+                k = torch.zeros(self.cfg.n_kv_head, capacity, self.cfg.head_dim, device=dev)
+                v = torch.zeros(self.cfg.n_kv_head, capacity, self.cfg.head_dim, device=dev)
+                caches.append((k, v))
+            return caches
+        dev = self.device
         empty = lambda: torch.zeros(self.cfg.n_kv_head, capacity, self.cfg.head_dim, device=dev)
         return [(empty(), empty()) for _ in range(self.cfg.n_layers)]
 
