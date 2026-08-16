@@ -18,7 +18,7 @@ from .engine import Engine
 def bench_my_engine(model: str, prompt: str, n_tokens: int):
     eng = Engine(model)
     ids = eng.tok.encode(prompt)
-    cache = eng._empty_cache()
+    cache = eng._empty_cache(len(ids) + n_tokens)
     tokens = torch.tensor(ids, device=eng.device)
     positions = torch.arange(len(ids), device=eng.device)
 

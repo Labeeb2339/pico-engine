@@ -49,10 +49,10 @@ Same GGUF, same prompt, greedy decoding, 128 tokens, RTX 5070 Laptop:
 
 | engine | prefill | decode tok/s |
 |--------|---------|--------------|
-| pico-engine | 0.21 s | **49.1** |
+| pico-engine | 0.21 s | **53.0** |
 | llama.cpp | — | **102.1** |
 
-pico-engine is **~2.1× slower** than llama.cpp. The decode path is
+pico-engine is **~1.9× slower** than llama.cpp. The decode path is
 *CPU-dispatch-bound*, not compute- or bandwidth-bound: each generated token runs
 hundreds of tiny kernels, and the CPU spends most of its time dispatching them
 while the GPU sits mostly idle. The measured progression:
@@ -63,7 +63,8 @@ while the GPU sits mostly idle. The measured progression:
 | fused QKV + gate/up projections | 23.2 |
 | fused Triton RMSNorm + RoPE | 33.5 |
 | drop dead causal mask | 36.7 |
-| fused Triton decode attention | **49.1** |
+| fused Triton decode attention | 49.1 |
+| preallocate KV cache + hoist RoPE gather | **53.0** |
 
 Two hypotheses were tested and **rejected**, both measured:
 
@@ -76,11 +77,12 @@ Two hypotheses were tested and **rejected**, both measured:
 What actually moved the needle was profiling, not guessing. The profiler showed
 `scaled_dot_product_attention` dispatch at **43% of CPU time** plus a causal mask
 rebuilt with `arange`+`ge` on every layer of every step (**12%**) — and that
-mask is *all-True* for single-token decode, so it was dead work. Removing it and
+mask is *all-True* for single-token decode, so it was dead work. Removing it,
 replacing SDPA's dispatch with one fused Triton decode-attention kernel (online
-softmax, GQA — `src/pico_engine/kernels.py:decode_attn`) took decode 33.5 →
-49.1 tok/s. (Greedy outputs diverge slightly from llama.cpp — fp32-vs-fp16
-numerics, not a bug.)
+softmax, GQA — `src/pico_engine/kernels.py:decode_attn`), then preallocating the
+KV cache (killing the per-step `torch.cat`) and hoisting the RoPE gather out of
+the per-layer loop, took decode 33.5 → 53.0 tok/s. (Greedy outputs diverge
+slightly from llama.cpp — fp32-vs-fp16 numerics, not a bug.)
 
 ```
 $ python -m pico_engine.benchmark models/qwen2.5-0.5b-instruct-q4_k_m.gguf
@@ -111,11 +113,9 @@ python -m pico_engine <model.gguf> --prompt "Hello" --max-tokens 64
 ## What I would do next
 
 - **Fuse the whole layer** — one Triton kernel for RMSNorm→QKV→RoPE→attention→
-  SwiGLU MLP→residual would collapse the remaining ~15 launches/layer (four
-  matmuls + three elementwise kernels + cats + reshapes) into one or two. This
-  is the real remaining dispatch lever — the GEMV/GEMM work was measured neutral.
-- **Preallocate the KV cache** — the per-step `torch.cat` reallocates and copies
-  O(S) on every token.
+  SwiGLU MLP→residual would collapse the remaining ~10 launches/layer (four
+  matmuls + three elementwise kernels + reshapes) into one or two. This is the
+  real remaining dispatch lever — the GEMV/GEMM work was measured neutral.
 - **Quantized matmuls** — weights are dequantized to fp32 (~2.5 GB read/token);
   multiplying directly against the 4/5/8-bit blocks like llama.cpp cuts that
   ~4×. This only pays off once the dispatch is tamed (fp16 was slower, so the

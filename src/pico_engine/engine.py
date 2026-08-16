@@ -59,15 +59,15 @@ class Engine:
                 weights[t.name] = w
         return weights
 
-    def _empty_cache(self) -> list[tuple[torch.Tensor, torch.Tensor]]:
-        empty = lambda: torch.zeros(self.cfg.n_kv_head, 0, self.cfg.head_dim, device=self.device)
+    def _empty_cache(self, capacity: int) -> list[tuple[torch.Tensor, torch.Tensor]]:
+        empty = lambda: torch.zeros(self.cfg.n_kv_head, capacity, self.cfg.head_dim, device=self.device)
         return [(empty(), empty()) for _ in range(self.cfg.n_layers)]
 
     @torch.inference_mode()
     def generate(self, prompt: str, max_tokens: int = 64, temperature: float = 0.7,
                  top_k: int = 0, top_p: float = 0.9) -> tuple[str, list[int]]:
         ids = self.tok.encode(prompt)
-        cache = self._empty_cache()
+        cache = self._empty_cache(len(ids) + max_tokens)
 
         if not ids:
             return "", []

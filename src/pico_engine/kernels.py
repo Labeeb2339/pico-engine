@@ -88,10 +88,12 @@ def silu_mul(gate_up: torch.Tensor, ffn: int) -> torch.Tensor:
 
 
 @triton.jit
-def _decode_attn_fwd(q_ptr, k_ptr, v_ptr, o_ptr, S, scale,
+def _decode_attn_fwd(q_ptr, k_ptr, v_ptr, o_ptr, S, stride, scale,
                      HD: tl.constexpr, GROUP: tl.constexpr, BLOCK_S: tl.constexpr):
     # One program per query head. Single-query (decode) GQA attention with
-    # online softmax over the cached keys/values.
+    # online softmax over the cached keys/values. ``S`` is the valid cache
+    # length; ``stride`` is the buffer row stride (capacity, >= S) so it can
+    # read a pre-allocated cache in place without a per-step copy.
     h = tl.program_id(0)
     kv = h // GROUP                    # kv head this query head maps to (GQA)
     offs_d = tl.arange(0, HD)
@@ -104,9 +106,9 @@ def _decode_attn_fwd(q_ptr, k_ptr, v_ptr, o_ptr, S, scale,
     for s0 in range(0, S, BLOCK_S):
         offs_s = s0 + tl.arange(0, BLOCK_S)
         mask_s = offs_s < S
-        k = tl.load(k_ptr + kv * S * HD + offs_s[:, None] * HD + offs_d[None, :],
+        k = tl.load(k_ptr + kv * stride * HD + offs_s[:, None] * HD + offs_d[None, :],
                     mask=mask_s[:, None], other=0.0).to(tl.float32)
-        v = tl.load(v_ptr + kv * S * HD + offs_s[:, None] * HD + offs_d[None, :],
+        v = tl.load(v_ptr + kv * stride * HD + offs_s[:, None] * HD + offs_d[None, :],
                     mask=mask_s[:, None], other=0.0).to(tl.float32)
         s = tl.sum(k * q[None, :], axis=1) * scale          # (BLOCK_S,)
         s = tl.where(mask_s, s, float("-inf"))
@@ -122,22 +124,29 @@ def _decode_attn_fwd(q_ptr, k_ptr, v_ptr, o_ptr, S, scale,
 
 
 def decode_attn(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor,
+                S: int | None = None, stride: int | None = None,
                 scale: float | None = None) -> torch.Tensor:
     """Single-query GQA attention for decode.
 
-    q: (n_head, hd); k/v: (n_kv, S, hd) (the running cache). Returns
-    (n_head, hd). One Triton launch replaces the SDPA dispatch (which was the
-    dominant CPU cost on the launch-bound decode path).
+    q: (n_head, hd); k/v: (n_kv, capacity, hd) — the running cache buffer.
+    ``S`` is the valid cache length (defaults to the full buffer); ``stride`` is
+    the row stride in elements (defaults to capacity). Returns (n_head, hd).
+    One Triton launch replaces the SDPA dispatch (which was the dominant CPU
+    cost on the launch-bound decode path).
     """
     q = q.contiguous()
     k = k.contiguous()
     v = v.contiguous()
     n_head, hd = q.shape
-    n_kv, S, _ = k.shape
+    n_kv, capacity, _ = k.shape
+    if S is None:
+        S = capacity
+    if stride is None:
+        stride = capacity
     if scale is None:
         scale = hd ** -0.5
     group = n_head // n_kv
     out = torch.empty(n_head, hd, device=q.device, dtype=q.dtype)
-    _decode_attn_fwd[(n_head,)](q, k, v, out, S, scale,
+    _decode_attn_fwd[(n_head,)](q, k, v, out, S, stride, scale,
                                 HD=hd, GROUP=group, BLOCK_S=64, num_warps=4)
     return out

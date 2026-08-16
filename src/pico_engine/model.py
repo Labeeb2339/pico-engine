@@ -79,21 +79,28 @@ class Transformer:
         """Run ``token_ids`` (L,) at ``positions`` (L,), updating ``cache``.
 
         Returns logits (vocab_size,) for the last position. Each cache entry is
-        (k, v) with shape (n_kv_head, cache_len, head_dim).
+        a pre-allocated (k, v) buffer of shape (n_kv_head, capacity, head_dim),
+        written in place (no per-step ``torch.cat``).
         """
         cfg = self.cfg
-        x = self.embed[token_ids]  # (L, hidden), fp16
-
+        x = self.embed[token_ids]  # (L, hidden), fp32
+        # RoPE tables + scalar position hoisted out of the per-layer loop (the
+        # gather used to run 48x per token).
+        cos = self.cos[positions]
+        sin = self.sin[positions]
+        pos = int(positions[-1].item())  # last absolute position (one sync)
         for i in range(cfg.n_layers):
-            x, cache[i] = self._layer(i, x, positions, cache[i])
+            x = self._layer(i, x, pos, cos, sin, cache[i])
         x = rmsnorm(x, self._w("output_norm.weight"), cfg.eps)
         logits = x[-1] @ self._w("output.weight").T  # (vocab,)
         return logits
 
-    def _layer(self, i: int, x: torch.Tensor, positions: torch.Tensor,
-               cache: tuple[torch.Tensor, torch.Tensor]) -> tuple[torch.Tensor, tuple[torch.Tensor, torch.Tensor]]:
+    def _layer(self, i: int, x: torch.Tensor, pos: int, cos: torch.Tensor, sin: torch.Tensor,
+               cache: tuple[torch.Tensor, torch.Tensor]) -> torch.Tensor:
         cfg = self.cfg
         L = x.shape[0]
+        k_buf, v_buf = cache            # (n_kv, capacity, hd)
+        capacity = k_buf.shape[1]
         # attention norm
         h = rmsnorm(x, self._w(f"blk.{i}.attn_norm.weight"), cfg.eps)
 
@@ -104,31 +111,35 @@ class Transformer:
         v = v.view(L, cfg.n_kv_head, cfg.head_dim)
 
         # rotary embeddings (rotate-half, fused)
-        c = self.cos[positions]
-        s = self.sin[positions]
-        q = rope(q, c, s)
-        k = rope(k, c, s)
+        q = rope(q, cos, sin)
+        k = rope(k, cos, sin)
 
-        # append to cache (stores (n_kv, S, hd))
-        k_full = torch.cat([cache[0], k.transpose(0, 1)], dim=1)
-        v_full = torch.cat([cache[1], v.transpose(0, 1)], dim=1)
-        new_cache = (k_full, v_full)
+        # write k/v into the pre-allocated cache at their positions (in place,
+        # no torch.cat / reallocation per step)
+        k_t = k.transpose(0, 1)         # (n_kv, L, hd)
+        v_t = v.transpose(0, 1)
+        if L == 1:
+            k_buf[:, pos, :] = k_t[:, 0, :]
+            v_buf[:, pos, :] = v_t[:, 0, :]
+            S = pos + 1
+        else:
+            k_buf[:, :L, :] = k_t
+            v_buf[:, :L, :] = v_t
+            S = L
 
         # GQA attention. Prefill (L>1) uses fused SDPA with a native causal mask.
-        # Single-token decode uses a dedicated Triton kernel (one launch) instead
-        # of SDPA's dispatch, which was the dominant CPU cost on the launch-bound
-        # decode path.
+        # Single-token decode uses the fused Triton kernel (one launch).
         if L > 1:
             out = F.scaled_dot_product_attention(
-                q.transpose(0, 1).unsqueeze(0),   # (1, n_head, L, hd)
-                k_full.unsqueeze(0),              # (1, n_kv, S, hd)
-                v_full.unsqueeze(0),              # (1, n_kv, S, hd)
+                q.transpose(0, 1).unsqueeze(0),        # (1, n_head, L, hd)
+                k_buf[:, :S, :].contiguous().unsqueeze(0),
+                v_buf[:, :S, :].contiguous().unsqueeze(0),
                 is_causal=True,
                 enable_gqa=True,
             )
-            out = out.squeeze(0).transpose(0, 1)  # (L, n_head, hd)
+            out = out.squeeze(0).transpose(0, 1)       # (L, n_head, hd)
         else:
-            out = decode_attn(q[0], k_full, v_full).unsqueeze(0)  # (1, n_head, hd)
+            out = decode_attn(q[0], k_buf, v_buf, S=S, stride=capacity).unsqueeze(0)
         out = out.reshape(L, cfg.hidden) @ self._w(f"blk.{i}.attn_output.weight").T
 
         x = x + out
@@ -139,4 +150,4 @@ class Transformer:
         act = silu_mul(gate_up, cfg.ffn_dim)              # (L, ffn_dim) = silu(gate)*up
         x = torch.addmm(x, act, self._w(f"blk.{i}.ffn_down.weight").T)
 
-        return x, new_cache
+        return x
