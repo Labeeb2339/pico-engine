@@ -47,6 +47,15 @@ class BPETokenizer:
             self.merges[m] = i
         self.bos_id = bos_id
         self.eos_id = eos_id
+        # Special tokens like <|im_start|> must be matched atomically (they'd
+        # otherwise be split into subwords by the GPT-2 regex). Match any
+        # <|...|> token in the vocab before BPE.
+        self.special = [t for t in vocab if re.fullmatch(r"<\|[^|]*\|>", t)]
+        self.special_set = set(self.special)
+        self._special_re = None
+        if self.special:
+            alt = "|".join(re.escape(t) for t in sorted(self.special, key=len, reverse=True))
+            self._special_re = re.compile(f"({alt})")
 
     def _bpe(self, token: str) -> list[str]:
         word = list(token)
@@ -66,6 +75,19 @@ class BPETokenizer:
         return word
 
     def encode(self, text: str) -> list[int]:
+        if self._special_re is not None:
+            ids: list[int] = []
+            for part in self._special_re.split(text):
+                if not part:
+                    continue
+                if part in self.special_set:
+                    ids.append(self.vocab_id[part])
+                else:
+                    ids.extend(self._bpe_encode_part(part))
+            return ids
+        return self._bpe_encode_part(text)
+
+    def _bpe_encode_part(self, text: str) -> list[int]:
         ids: list[int] = []
         for match in _SPLIT.finditer(text):
             piece = match.group(0)
