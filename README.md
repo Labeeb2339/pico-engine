@@ -49,12 +49,12 @@ Same GGUF, same prompt, greedy decoding, 128 tokens, RTX 5070 Laptop:
 
 | engine | prefill | decode tok/s |
 |--------|---------|--------------|
-| pico-engine | 0.21 s | **57** |
-| llama.cpp | — | **102.1** |
+| pico-engine | 0.08 s | **149.0** |
+| llama.cpp | — | **108.1** |
 
-pico-engine is **~1.8× slower** than llama.cpp. The decode path is
-*launch- and bandwidth-bound*: each token runs hundreds of small kernels, and the
-matmuls read the fp32-dequantized weights. The measured progression:
+pico-engine is **~1.4× faster** than llama.cpp. The decode path was
+*CPU-dispatch-bound*: ~200 kernel launches per token meant the CPU, not the
+GPU, was the bottleneck. The measured progression:
 
 | change | decode tok/s |
 |--------|--------------|
@@ -64,7 +64,9 @@ matmuls read the fp32-dequantized weights. The measured progression:
 | drop dead causal mask | 36.7 |
 | fused Triton decode attention | 49.1 |
 | preallocate KV cache + hoist RoPE gather | 53.0 |
-| Q8_0/Q5_0 quantized matmuls + fused norm/rope/bias | **57** |
+| Q8_0/Q5_0 quantized matmuls + fused norm/rope/bias | 57 |
+| Q6_K/Q4_K quantized ffn_down | 61.5 |
+| **CUDA-graph decode loop** | **149.0** |
 
 Two hypotheses were tested and **rejected**, both measured:
 
@@ -81,8 +83,19 @@ mask is *all-True* for single-token decode, so it was dead work. Removing it,
 replacing SDPA's dispatch with one fused Triton decode-attention kernel (online
 softmax, GQA — `src/pico_engine/kernels.py:decode_attn`), then preallocating the
 KV cache (killing the per-step `torch.cat`) and hoisting the RoPE gather out of
-the per-layer loop, took decode 33.5 → 53.0 tok/s. (Greedy outputs diverge
-slightly from llama.cpp — fp32-vs-fp16 numerics, not a bug.)
+the per-layer loop, took decode 33.5 → 53.0 tok/s.
+
+After the attention win, the profiler pointed at two remaining costs: the
+matmuls (memory-bound on fp32-dequantized weights — the model is ~630M params,
+~2.5 GB read per token) and the sheer number of kernel launches (~200/token).
+Multiplying against the packed quantized blocks directly — Q8_0 for the output
+projection, Q5_0 for gate/up, Q6_K/Q4_K for `ffn_down` — cut the weight traffic
+~4× (57 → 61.5 tok/s). But the real wall was CPU dispatch: timing the CPU enqueue
+against wall clock showed the CPU spent about as long *launching* kernels as the
+GPU spent running them. Capturing the single-token forward into a CUDA graph and
+replaying it per step collapsed ~200 launches into one call, taking decode
+61.5 → 149.0 tok/s — past llama.cpp. (Greedy output matches llama.cpp for ~100
+tokens, then fp32-vs-fp16 numerics diverge.)
 
 ```
 $ python -m pico_engine.benchmark models/qwen2.5-0.5b-instruct-q4_k_m.gguf
@@ -112,18 +125,18 @@ python -m pico_engine <model.gguf> --prompt "Hello" --max-tokens 64
 
 ## What I would do next
 
-- **Fuse the whole layer** — one Triton kernel for RMSNorm→QKV→RoPE→attention→
-  SwiGLU MLP→residual would collapse the remaining ~9 launches/layer into one.
-  This is the real remaining lever: the GPU is launch-bound on the small kernels
-  (attention/elementwise ~9ms/token) and bandwidth-bound on the fp32 matmuls.
-- **Quantize the remaining matmuls** — `ffn_down` (Q4_K/Q6_K) still dequantizes
-  to fp32; Q8_0 (output) and Q5_0 (gate/up) already multiply against the
-  quantized blocks directly. The QKV and attn-output matmuls are small enough to
-  be launch-bound, so quantizing them would not help.
+- **Fuse the whole layer into one Triton kernel** — the CUDA graph hides the
+  ~200-launch overhead but still runs ~200 kernels; a single fused
+  RMSNorm→QKV→RoPE→attention→SwiGLU→residual kernel per layer would cut the
+  GPU-side work too (mostly prefill).
+- **fp16/bf16 compute** — attention and the GEMVs still accumulate in fp32;
+  tensor cores would speed up long-sequence prefill more than decode.
+- **More architectures** — the loader/forward is Qwen2/LLaMA-shaped; MoE
+  (Qwen2.5-MoE) or Mamba would stress the design.
 
 ## Honest limits
 
 - fp32 compute (slow, exact). No tensor cores in the attention path.
-- KV cache reallocates on every step (`torch.cat`) rather than preallocating.
+- Decode throughput is a CUDA-graph capture; prefill is still eager.
 - Single architecture (Qwen2/LLaMA-style) — not a general GGUF runner.
 - No chat template yet; raw completion prompts only.
