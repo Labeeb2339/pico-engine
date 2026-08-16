@@ -82,17 +82,18 @@ class Transformer:
 
         Returns logits (vocab_size,) for the last position. Each cache entry is
         a pre-allocated (k, v) buffer of shape (n_kv_head, capacity, head_dim),
-        written in place (no per-step ``torch.cat``).
+        written in place (no per-step ``torch.cat``). The decode path uses only
+        device-tensor positions (no ``.item()`` sync), so it can be captured
+        and replayed as a CUDA graph.
         """
         cfg = self.cfg
         x = self.embed[token_ids]  # (L, hidden), fp32
-        # RoPE tables + scalar position hoisted out of the per-layer loop (the
-        # gather used to run 48x per token).
+        # RoPE tables hoisted out of the per-layer loop (the gather used to run
+        # 48x per token).
         cos = self.cos[positions]
         sin = self.sin[positions]
-        pos = int(positions[-1].item())  # last absolute position (one sync)
         for i in range(cfg.n_layers):
-            x = self._layer(i, x, pos, cos, sin, cache[i])
+            x = self._layer(i, x, positions, cos, sin, cache[i])
         x = rmsnorm(x, self._w("output_norm.weight"), cfg.eps)
         if "output" in self.quant:
             qs, d = self.quant["output"]
@@ -101,7 +102,8 @@ class Transformer:
             logits = x[-1] @ self._w("output.weight").T
         return logits
 
-    def _layer(self, i: int, x: torch.Tensor, pos: int, cos: torch.Tensor, sin: torch.Tensor,
+    def _layer(self, i: int, x: torch.Tensor, positions: torch.Tensor,
+               cos: torch.Tensor, sin: torch.Tensor,
                cache: tuple[torch.Tensor, torch.Tensor]) -> torch.Tensor:
         cfg = self.cfg
         L = x.shape[0]
@@ -119,13 +121,14 @@ class Transformer:
         v = qkv[:, cfg.hidden + cfg.n_kv_head * cfg.head_dim:].view(L, cfg.n_kv_head, cfg.head_dim)
 
         # write k/v into the pre-allocated cache at their positions (in place,
-        # no torch.cat / reallocation per step)
+        # no torch.cat / reallocation per step; index_copy_ with a device
+        # position tensor so the write is CUDA-graph capturable)
         k_t = k.transpose(0, 1)         # (n_kv, L, hd)
         v_t = v.transpose(0, 1)
         if L == 1:
-            k_buf[:, pos, :] = k_t[:, 0, :]
-            v_buf[:, pos, :] = v_t[:, 0, :]
-            S = pos + 1
+            k_buf.index_copy_(1, positions, k_t.contiguous())
+            v_buf.index_copy_(1, positions, v_t.contiguous())
+            S = positions + 1           # (1,) device tensor = valid cache length
         else:
             k_buf[:, :L, :] = k_t
             v_buf[:, :L, :] = v_t

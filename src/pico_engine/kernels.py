@@ -88,14 +88,16 @@ def silu_mul(gate_up: torch.Tensor, ffn: int) -> torch.Tensor:
 
 
 @triton.jit
-def _decode_attn_fwd(q_ptr, k_ptr, v_ptr, o_ptr, S, stride, scale,
+def _decode_attn_fwd(q_ptr, k_ptr, v_ptr, o_ptr, s_ptr, stride, scale,
                      HD: tl.constexpr, GROUP: tl.constexpr, BLOCK_S: tl.constexpr):
     # One program per query head. Single-query (decode) GQA attention with
-    # online softmax over the cached keys/values. ``S`` is the valid cache
-    # length; ``stride`` is the buffer row stride (capacity, >= S) so it can
-    # read a pre-allocated cache in place without a per-step copy.
+    # online softmax over the cached keys/values. ``stride`` is the buffer row
+    # stride (capacity) — the loop bound; ``s_ptr`` is a device scalar holding
+    # the *valid* cache length S (read at replay time so a CUDA graph can
+    # re-use this kernel across growing sequences).
     h = tl.program_id(0)
     kv = h // GROUP                    # kv head this query head maps to (GQA)
+    S = tl.load(s_ptr).to(tl.int32)
     offs_d = tl.arange(0, HD)
     q = tl.load(q_ptr + h * HD + offs_d).to(tl.float32)   # (HD,)
 
@@ -103,15 +105,16 @@ def _decode_attn_fwd(q_ptr, k_ptr, v_ptr, o_ptr, S, stride, scale,
     l_i = tl.zeros((), tl.float32)
     acc = tl.zeros((HD,), tl.float32)
 
-    for s0 in range(0, S, BLOCK_S):
+    for s0 in range(0, stride, BLOCK_S):
         offs_s = s0 + tl.arange(0, BLOCK_S)
-        mask_s = offs_s < S
+        load_mask = offs_s < stride            # bounds for the buffer read
+        valid = offs_s < S                     # positions actually written so far
         k = tl.load(k_ptr + kv * stride * HD + offs_s[:, None] * HD + offs_d[None, :],
-                    mask=mask_s[:, None], other=0.0).to(tl.float32)
+                    mask=load_mask[:, None], other=0.0).to(tl.float32)
         v = tl.load(v_ptr + kv * stride * HD + offs_s[:, None] * HD + offs_d[None, :],
-                    mask=mask_s[:, None], other=0.0).to(tl.float32)
+                    mask=load_mask[:, None], other=0.0).to(tl.float32)
         s = tl.sum(k * q[None, :], axis=1) * scale          # (BLOCK_S,)
-        s = tl.where(mask_s, s, float("-inf"))
+        s = tl.where(valid, s, float("-inf"))
         m_new = tl.maximum(m_i, tl.max(s, axis=0))
         alpha = tl.exp(m_i - m_new)
         p = tl.exp(s - m_new)                                # (BLOCK_S,)
@@ -124,15 +127,15 @@ def _decode_attn_fwd(q_ptr, k_ptr, v_ptr, o_ptr, S, stride, scale,
 
 
 def decode_attn(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor,
-                S: int | None = None, stride: int | None = None,
+                S: torch.Tensor | int | None = None, stride: int | None = None,
                 scale: float | None = None) -> torch.Tensor:
     """Single-query GQA attention for decode.
 
     q: (n_head, hd); k/v: (n_kv, capacity, hd) — the running cache buffer.
-    ``S`` is the valid cache length (defaults to the full buffer); ``stride`` is
-    the row stride in elements (defaults to capacity). Returns (n_head, hd).
-    One Triton launch replaces the SDPA dispatch (which was the dominant CPU
-    cost on the launch-bound decode path).
+    ``S`` is the valid cache length (a device scalar tensor, or an int);
+    ``stride`` is the row stride in elements (defaults to capacity). Returns
+    (n_head, hd). One Triton launch replaces the SDPA dispatch (which was the
+    dominant CPU cost on the launch-bound decode path).
     """
     q = q.contiguous()
     k = k.contiguous()
@@ -146,6 +149,9 @@ def decode_attn(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor,
     if scale is None:
         scale = hd ** -0.5
     group = n_head // n_kv
+    if isinstance(S, int):
+        S = torch.tensor(S, device=q.device, dtype=torch.int32)
+    S = S.contiguous().reshape(-1)  # 1-element device tensor
     out = torch.empty(n_head, hd, device=q.device, dtype=q.dtype)
     _decode_attn_fwd[(n_head,)](q, k, v, out, S, stride, scale,
                                 HD=hd, GROUP=group, BLOCK_S=64, num_warps=4)

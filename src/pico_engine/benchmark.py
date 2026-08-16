@@ -19,6 +19,9 @@ def bench_my_engine(model: str, prompt: str, n_tokens: int):
     eng = Engine(model)
     ids = eng.tok.encode(prompt)
     cache = eng._empty_cache(len(ids) + n_tokens)
+    # capture the decode graph before prefill (warmup writes a scratch position)
+    graph = eng._build_decode_graph(cache)
+
     tokens = torch.tensor(ids, device=eng.device)
     positions = torch.arange(len(ids), device=eng.device)
 
@@ -30,15 +33,11 @@ def bench_my_engine(model: str, prompt: str, n_tokens: int):
     t0 = time.perf_counter()
     for _ in range(n_tokens):
         nxt = int(logits.argmax())
-        generated.append(nxt)
         if nxt == eng.tok.eos_id:
             break
         pos = len(ids) + len(generated)
-        logits = eng.model.forward(
-            torch.tensor([nxt], device=eng.device),
-            torch.tensor([pos], device=eng.device),
-            cache,
-        )
+        generated.append(nxt)
+        logits = eng._decode_step(nxt, pos, cache, graph)
     decode_s = time.perf_counter() - t0
     return prefill_s, decode_s, len(generated), eng.tok.decode(generated)
 

@@ -135,14 +135,56 @@ class Engine:
             quant["down"] = down
             return quant
 
+    def _build_decode_graph(self, cache):
+        """Capture the single-token decode forward into a CUDA graph.
+
+        The decode step is CPU-dispatch-bound (~200+ kernel launches/token), so
+        a graph replay collapses that dispatch to one call. Returns the graph,
+        or None if capture fails (falls back to eager).
+        """
+        self._static_ids = torch.zeros(1, dtype=torch.long, device=self.device)
+        self._static_pos = torch.zeros(1, dtype=torch.long, device=self.device)
+        try:
+            s = torch.cuda.Stream()
+            s.wait_stream(torch.cuda.current_stream())
+            with torch.cuda.stream(s):
+                for _ in range(3):
+                    self.model.forward(self._static_ids, self._static_pos, cache)
+            torch.cuda.current_stream().wait_stream(s)
+            g = torch.cuda.CUDAGraph()
+            with torch.cuda.graph(g):
+                self._static_logits = self.model.forward(self._static_ids, self._static_pos, cache)
+            self._graph = g
+            return g
+        except Exception:
+            self._graph = None
+            return None
+
+    def _decode_step(self, token: int, pos: int, cache, graph):
+        if graph is not None:
+            self._static_ids.copy_(torch.tensor([token], device=self.device))
+            self._static_pos.copy_(torch.tensor([pos], device=self.device))
+            graph.replay()
+            return self._static_logits
+        return self.model.forward(
+            torch.tensor([token], device=self.device),
+            torch.tensor([pos], device=self.device),
+            cache,
+        )
+
     @torch.inference_mode()
     def generate(self, prompt: str, max_tokens: int = 64, temperature: float = 0.7,
                  top_k: int = 0, top_p: float = 0.9) -> tuple[str, list[int]]:
         ids = self.tok.encode(prompt)
-        cache = self._empty_cache(len(ids) + max_tokens)
-
         if not ids:
             return "", []
+
+        cache = self._empty_cache(len(ids) + max_tokens)
+
+        # Capture the decode graph *before* prefill (the capture warmup writes
+        # a scratch position into the cache; the prefill below then overwrites
+        # the real positions).
+        graph = self._build_decode_graph(cache) if self.device.type == "cuda" else None
 
         # prefill
         tokens = torch.tensor(ids, device=self.device)
@@ -156,10 +198,6 @@ class Engine:
                 break
             pos = len(ids) + len(generated)  # position of this new token (0-indexed)
             generated.append(nxt)
-            logits = self.model.forward(
-                torch.tensor([nxt], device=self.device),
-                torch.tensor([pos], device=self.device),
-                cache,
-            )
+            logits = self._decode_step(nxt, pos, cache, graph)
 
         return self.tok.decode(generated), generated
