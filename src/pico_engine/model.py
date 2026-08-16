@@ -14,6 +14,7 @@ Reference architecture: Qwen2.5 (the target model), which is LLaMA-style.
 
 from __future__ import annotations
 
+from contextlib import nullcontext
 from dataclasses import dataclass
 
 import torch
@@ -87,20 +88,26 @@ class Transformer:
         and replayed as a CUDA graph.
         """
         cfg = self.cfg
-        x = self.embed[token_ids]  # (L, hidden), fp32
-        # RoPE tables hoisted out of the per-layer loop (the gather used to run
-        # 48x per token).
-        cos = self.cos[positions]
-        sin = self.sin[positions]
-        for i in range(cfg.n_layers):
-            x = self._layer(i, x, positions, cos, sin, cache[i])
-        x = rmsnorm(x, self._w("output_norm.weight"), cfg.eps)
-        if "output" in self.quant:
-            qs, d = self.quant["output"]
-            logits = q8_0_gemv(x[-1], qs, d)          # Q8_0 quantized projection
-        else:
-            logits = x[-1] @ self._w("output.weight").T
-        return logits
+        L = token_ids.shape[0]
+        # Prefill (L>1) runs the batched matmuls + SDPA in fp16 (tensor cores +
+        # flash attention); decode (L=1) stays fp32 so the CUDA-graph capture is
+        # unaffected.
+        use_fp16 = L > 1 and self.device.type == "cuda"
+        with torch.autocast(device_type="cuda", dtype=torch.float16, enabled=use_fp16):
+            x = self.embed[token_ids]  # (L, hidden)
+            # RoPE tables hoisted out of the per-layer loop (the gather used to run
+            # 48x per token).
+            cos = self.cos[positions]
+            sin = self.sin[positions]
+            for i in range(cfg.n_layers):
+                x = self._layer(i, x, positions, cos, sin, cache[i])
+            x = rmsnorm(x, self._w("output_norm.weight"), cfg.eps)
+            if "output" in self.quant:
+                qs, d = self.quant["output"]
+                logits = q8_0_gemv(x[-1], qs, d)          # Q8_0 quantized projection
+            else:
+                logits = x[-1] @ self._w("output.weight").T
+            return logits
 
     def _layer(self, i: int, x: torch.Tensor, positions: torch.Tensor,
                cos: torch.Tensor, sin: torch.Tensor,

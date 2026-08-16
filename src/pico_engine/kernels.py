@@ -16,11 +16,11 @@ def _rmsnorm_fwd(x_ptr, w_ptr, out_ptr, n, eps, BLOCK: tl.constexpr):
     row = tl.program_id(0)
     cols = tl.arange(0, BLOCK)
     mask = cols < n
-    x = tl.load(x_ptr + row * n + cols, mask=mask, other=0.0)
-    w = tl.load(w_ptr + cols, mask=mask, other=0.0)
+    x = tl.load(x_ptr + row * n + cols, mask=mask, other=0.0).to(tl.float32)
+    w = tl.load(w_ptr + cols, mask=mask, other=0.0).to(tl.float32)
     var = tl.sum(x * x, axis=0) / n
     rstd = 1.0 / tl.sqrt(var + eps)
-    tl.store(out_ptr + row * n + cols, x * rstd * w, mask=mask)
+    tl.store(out_ptr + row * n + cols, (x * rstd * w).to(out_ptr.dtype.element_ty), mask=mask)
 
 
 def rmsnorm(x: torch.Tensor, weight: torch.Tensor, eps: float) -> torch.Tensor:
@@ -39,12 +39,12 @@ def _rope_fwd(x_ptr, cos_ptr, sin_ptr, out_ptr, n_head, half, H: tl.constexpr):
     pid = tl.program_id(0)
     l = pid // n_head
     j = tl.arange(0, H)
-    cos = tl.load(cos_ptr + l * half + j)
-    sin = tl.load(sin_ptr + l * half + j)
-    x1 = tl.load(x_ptr + pid * 2 * half + j)
-    x2 = tl.load(x_ptr + pid * 2 * half + j + half)
-    tl.store(out_ptr + pid * 2 * half + j, x1 * cos - x2 * sin)
-    tl.store(out_ptr + pid * 2 * half + j + half, x1 * sin + x2 * cos)
+    cos = tl.load(cos_ptr + l * half + j).to(tl.float32)
+    sin = tl.load(sin_ptr + l * half + j).to(tl.float32)
+    x1 = tl.load(x_ptr + pid * 2 * half + j).to(tl.float32)
+    x2 = tl.load(x_ptr + pid * 2 * half + j + half).to(tl.float32)
+    tl.store(out_ptr + pid * 2 * half + j, (x1 * cos - x2 * sin).to(out_ptr.dtype.element_ty))
+    tl.store(out_ptr + pid * 2 * half + j + half, (x1 * sin + x2 * cos).to(out_ptr.dtype.element_ty))
 
 
 def rope(x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor) -> torch.Tensor:
@@ -68,10 +68,10 @@ def _silu_mul_fwd(gate_up_ptr, out_ptr, ffn, n, BLOCK: tl.constexpr):
     mask = offs < n
     row = offs // ffn
     col = offs % ffn
-    g = tl.load(gate_up_ptr + row * 2 * ffn + col, mask=mask)
-    u = tl.load(gate_up_ptr + row * 2 * ffn + ffn + col, mask=mask)
+    g = tl.load(gate_up_ptr + row * 2 * ffn + col, mask=mask).to(tl.float32)
+    u = tl.load(gate_up_ptr + row * 2 * ffn + ffn + col, mask=mask).to(tl.float32)
     act = g * tl.sigmoid(g) * u
-    tl.store(out_ptr + offs, act, mask=mask)
+    tl.store(out_ptr + offs, act.to(out_ptr.dtype.element_ty), mask=mask)
 
 
 def silu_mul(gate_up: torch.Tensor, ffn: int) -> torch.Tensor:
