@@ -154,12 +154,14 @@ top-k weights, scaling the sparse-expert output ~2× and corrupting the forward.
 Using the raw top-k softmax weights turned `There are 101 places...` into
 `Paris.`. A config flag, not the math, was the difference.
 
-**Performance (honest):** this path is correctness-first. It runs on CPU in RAM
-at **~0.87 tok/s decode** — the 152k-vocab output projection dominates; the
-sparse expert GEMVs are cheap. llama.cpp's CUDA build with the same partial
-offload does ~35 tok/s. Partial GPU offloading (llama.cpp's `-ngl` equivalent)
-is the natural next step, but the 14B weights fundamentally cannot all fit in
-VRAM, so it stays memory-bound.
+**Performance (honest):** correctness-first, and it shows. CPU-only in RAM is
+**~0.87 tok/s decode**; partial GPU offload (10 of 24 layers, the `-ngl`
+equivalent) lifts it to **~1.14 tok/s**. The 152k-vocab output projection and
+the CPU-resident layers dominate — the 14B weights fundamentally cannot all fit
+in 8 GB VRAM, so it stays memory-bound. llama.cpp's CUDA build with the same
+partial offload does ~35 tok/s; the gap is the CPU path, where llama.cpp has
+hand-tuned multi-threaded AVX kernels and pico-engine uses torch's vectorized
+ops.
 
 ## Supported quantization
 
@@ -197,11 +199,8 @@ post-CUDA-graph path, where decode is no longer launch-bound):
   (silu, output-norm) into the memory-bound GEMVs just adds compute to their
   critical path without saving any launches.
 
-The remaining genuine directions are architectural:
+The remaining genuine direction is architectural:
 
-- **Partial GPU offload for MoE** — llama.cpp's `-ngl` equivalent: keep ~13 of
-  24 layers on the GPU, stream the rest from RAM. The 14B weights can't all fit
-  in VRAM, so it stays memory-bound, but it's the missing "real engine" feature.
 - **Mamba (SSM)** — the remaining stress test for the loader/forward; a
   non-attention architecture would validate the abstraction.
 
