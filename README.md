@@ -49,19 +49,25 @@ Same GGUF, same prompt, greedy decoding, 128 tokens, RTX 5070 Laptop:
 
 | engine | prefill | decode tok/s |
 |--------|---------|--------------|
-| pico-engine | 0.21 s | **23.2** |
-| llama.cpp | — | **102.6** |
+| pico-engine | 0.21 s | **33.5** |
+| llama.cpp | — | **102.1** |
 
-pico-engine is **~4.4× slower** than llama.cpp — and that gap is honest. The
+pico-engine is **~3.0× slower** than llama.cpp — and that gap is honest. The
 decode path is *launch-bound*, not bandwidth- or compute-bound: each generated
-token runs ~250 small torch ops (24 layers × ~10 kernels), and the M=1 matmuls
-never amortize their launch cost. Fusing the per-layer QKV and gate/up
-projections into single matmuls (3→1 and 2→1) moved it from 21.4 to 23.2 tok/s;
+token runs hundreds of tiny kernels (24 layers × ~14 ops), and the M=1 matmuls
+never amortize their launch cost. Two measured wins closed the gap from 21.4 →
+33.5 tok/s:
+
+1. **Fused QKV + gate/up projections** (3→1 and 2→1 matmuls) — 21.4 → 23.2.
+2. **Fused Triton RMSNorm + RoPE kernels** (`src/pico_engine/kernels.py`) — the
+   ~5-op torch RMSNorm and ~4-op torch RoPE collapse to one launch each, ~48×
+   per token — 23.2 → 33.5.
+
 **fp16 and `scaled_dot_product_attention` did not help** — fp16's memory savings
 don't matter when you're not bandwidth-bound, and flash attention pays off at
-long sequences, not M=1 decode. llama.cpp's advantage is hand-fused CUDA kernels
-(RMSNorm+QKV, fused SwiGLU), which is the real next step. (Greedy outputs diverge
-slightly from llama.cpp — fp32-vs-fp16 numerics, not a bug.)
+long sequences, not M=1 decode. llama.cpp's remaining edge is hand-fused CUDA
+kernels (fused SwiGLU + RMSNorm-QKV), which is the next lever. (Greedy outputs
+diverge slightly from llama.cpp — fp32-vs-fp16 numerics, not a bug.)
 
 ```
 $ python -m pico_engine.benchmark models/qwen2.5-0.5b-instruct-q4_k_m.gguf
@@ -91,11 +97,10 @@ python -m pico_engine <model.gguf> --prompt "Hello" --max-tokens 64
 
 ## What I would do next
 
-- Write a fused Triton kernel for the FFN (gate+up+SiLU+down in one pass) and a
-  fused RMSNorm+QKV — the `pico-kernels` integration that actually closes the
-  launch-bound gap. That's the real lever; fp16/SDPA were measured and did not help.
+- Fuse the SwiGLU down-projection (SiLU·gate + down matmul) into one Triton GEMM
+  with a fused epilogue — the remaining launch-bound lever.
+- Fuse the residual adds into the matmul epilogues.
 - Preallocate the KV cache (avoid the per-step `torch.cat` reallocation).
-- Add batched/continuous prefill.
 
 ## Honest limits
 

@@ -1,13 +1,12 @@
 """LLaMA/Qwen-style transformer forward pass, from scratch.
 
 Implements RMSNorm, rotary embeddings (rotate-half), grouped-query attention
-with a KV cache, and SwiGLU MLP. Weights come from :mod:`engine` already
-dequantized and cast to fp16; the GGUF linear convention is ``out = x @ W.T``
-(i.e. weights are stored (in_features, out_features), no transpose).
+with a KV cache, and SwiGLU MLP. Weights come from :mod:`engine` already dequantized; the GGUF linear
+convention is ``out = x @ W.T`` (weights stored (in, out), no transpose).
 
-Compute runs in fp16 for tensor-core matmuls. The two numerically-sensitive
-reductions — RMSNorm mean/rsqrt and the attention softmax — are done in fp32
-and cast back, matching llama.cpp's mixed-precision approach.
+The hot elementwise/reduction ops (RMSNorm, RoPE) run as fused Triton kernels
+(:mod:`kernels`) because the M=1 decode path is launch-bound, not
+bandwidth-bound. Matmuls stay in torch (cuBLAS).
 
 Reference architecture: Qwen2.5 (the target model), which is LLaMA-style.
 """
@@ -18,6 +17,8 @@ from dataclasses import dataclass
 
 import torch
 import torch.nn.functional as F
+
+from .kernels import rmsnorm, rope
 
 
 @dataclass
@@ -42,7 +43,7 @@ class Transformer:
     def __init__(self, cfg: ModelConfig, weights: dict[str, torch.Tensor], device: torch.device):
         self.cfg = cfg
         self.device = device
-        self.w = weights  # name -> fp16 tensor on device
+        self.w = weights  # name -> tensor on device
         # token embedding: GGUF (hidden, vocab) -> loaded as (vocab, hidden); direct lookup
         self.embed = weights["token_embd.weight"]
 
@@ -75,11 +76,6 @@ class Transformer:
     def _w(self, name: str) -> torch.Tensor:
         return self.w[name]
 
-    def _rmsnorm(self, x: torch.Tensor, weight: torch.Tensor, eps: float) -> torch.Tensor:
-        # fp32 reduction for stability, cast back to fp16
-        rstd = torch.rsqrt(x.float().pow(2).mean(-1, keepdim=True) + eps)
-        return (x.float() * rstd * weight.float()).to(x.dtype)
-
     @torch.inference_mode()
     def forward(self, token_ids: torch.Tensor, positions: torch.Tensor,
                 cache: list[tuple[torch.Tensor, torch.Tensor]]) -> torch.Tensor:
@@ -93,7 +89,7 @@ class Transformer:
 
         for i in range(cfg.n_layers):
             x, cache[i] = self._layer(i, x, positions, cache[i])
-        x = self._rmsnorm(x, self._w("output_norm.weight"), cfg.eps)
+        x = rmsnorm(x, self._w("output_norm.weight"), cfg.eps)
         logits = x[-1] @ self._w("output.weight").T  # (vocab,)
         return logits
 
@@ -102,7 +98,7 @@ class Transformer:
         cfg = self.cfg
         L = x.shape[0]
         # attention norm
-        h = self._rmsnorm(x, self._w(f"blk.{i}.attn_norm.weight"), cfg.eps)
+        h = rmsnorm(x, self._w(f"blk.{i}.attn_norm.weight"), cfg.eps)
 
         qkv = h @ self.qkv_w[i].T + self.qkv_b[i]  # (L, n_head*hd + 2*n_kv*hd)
         q, k, v = qkv.split([cfg.hidden, cfg.n_kv_head * cfg.head_dim, cfg.n_kv_head * cfg.head_dim], dim=-1)
@@ -110,8 +106,11 @@ class Transformer:
         k = k.view(L, cfg.n_kv_head, cfg.head_dim)
         v = v.view(L, cfg.n_kv_head, cfg.head_dim)
 
-        # rotary embeddings (rotate-half)
-        q, k = self._rope(q, positions), self._rope(k, positions)
+        # rotary embeddings (rotate-half, fused)
+        c = self.cos[positions]
+        s = self.sin[positions]
+        q = rope(q, c, s)
+        k = rope(k, c, s)
 
         # append to cache (stores (n_kv, S, hd))
         k_full = torch.cat([cache[0], k.transpose(0, 1)], dim=1)
@@ -135,18 +134,10 @@ class Transformer:
         x = x + out
 
         # SwiGLU MLP
-        h = self._rmsnorm(x, self._w(f"blk.{i}.ffn_norm.weight"), cfg.eps)
+        h = rmsnorm(x, self._w(f"blk.{i}.ffn_norm.weight"), cfg.eps)
         gate_up = h @ self.gu_w[i].T                      # (L, 2*ffn_dim)
         gate, up = gate_up.split([cfg.ffn_dim, cfg.ffn_dim], dim=-1)
         gate = _silu(gate)
         x = x + (gate * up) @ self._w(f"blk.{i}.ffn_down.weight").T
 
         return x, new_cache
-
-    def _rope(self, x: torch.Tensor, positions: torch.Tensor) -> torch.Tensor:
-        # Qwen2 uses "rotate-half" RoPE: rotate the pair (x[i], x[i+d/2]) by theta_i.
-        c = self.cos[positions]  # (L, hd/2)
-        s = self.sin[positions]
-        x1, x2 = x[..., : x.shape[-1] // 2], x[..., x.shape[-1] // 2:]
-        return torch.cat([x1 * c.unsqueeze(1) - x2 * s.unsqueeze(1),
-                          x1 * s.unsqueeze(1) + x2 * c.unsqueeze(1)], dim=-1)
