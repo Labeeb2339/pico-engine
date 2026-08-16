@@ -117,6 +117,50 @@ tokens, then fp32-vs-fp16 numerics diverge.)
 $ python -m pico_engine.benchmark models/qwen2.5-0.5b-instruct-q4_k_m.gguf
 ```
 
+## MoE support — 14B Qwen1.5-MoE-A2.7B in 32 GB RAM
+
+The engine also runs **Qwen1.5-MoE-A2.7B-Chat** — 14.3B total params, 60
+experts, top-4 routing — a model that *cannot* fit the RTX 5070 Laptop's 8 GB
+VRAM, packed (9.5 GB) or unpacked (~14 GB int8). Running it forced the loader to
+earn its keep:
+
+- **Fully-quantized weights.** The dense path dequantizes to fp32; for 14B that
+  is ~57 GB and OOMs. The MoE path unpacks every tensor to **int8 + scales**
+  (~14 GB) and never materializes fp32, so the whole model lives in system RAM.
+- **Mixed quantization.** The Q4_K_M file mixes Q4_K/Q6_K/Q8_0/Q5_0 *per
+  tensor* (`ffn_down_exps` is Q8_0 on 12 layers and Q5_0 on the other 12). Every
+  type is dispatched by a tag.
+- **Sparse routing.** softmax over 60 experts → top-4, plus a gated shared expert.
+- **Chat template.** `<|im_start|>`/`<|im_end|>` are matched atomically before
+  BPE (the naive tokenizer split them into subwords, silently corrupting the
+  prompt).
+
+Correctness is verified against llama.cpp (CUDA b10452) on the same GGUF, greedy:
+
+| prompt (chat template) | pico-engine | llama.cpp |
+|------------------------|-------------|-----------|
+| "The capital of France is" | `Paris.` | `Paris.` |
+| "What is the capital of Malaysia?" | `Kuala Lumpur` | — |
+| "Write a haiku about the ocean" | correct 5-7-5 haiku | — |
+
+Every component is bit-exact against the reference `gguf` dequantizer (0.0 max
+error) and a streaming fp32 forward: dequant, all four quantized GEMV forms,
+attention (RoPE + softmax), the MoE FFN (router + experts + shared expert),
+embedding, and output projection.
+
+**One real bug, one real fix.** The first correct-looking-but-wrong run traced
+to `norm_topk_prob=False` in Qwen1.5-MoE's config — I had re-normalized the
+top-k weights, scaling the sparse-expert output ~2× and corrupting the forward.
+Using the raw top-k softmax weights turned `There are 101 places...` into
+`Paris.`. A config flag, not the math, was the difference.
+
+**Performance (honest):** this path is correctness-first. It runs on CPU in RAM
+at **~0.87 tok/s decode** — the 152k-vocab output projection dominates; the
+sparse expert GEMVs are cheap. llama.cpp's CUDA build with the same partial
+offload does ~35 tok/s. Partial GPU offloading (llama.cpp's `-ngl` equivalent)
+is the natural next step, but the 14B weights fundamentally cannot all fit in
+VRAM, so it stays memory-bound.
+
 ## Supported quantization
 
 | GGML type | used for | bytes/block |
@@ -153,15 +197,20 @@ post-CUDA-graph path, where decode is no longer launch-bound):
   (silu, output-norm) into the memory-bound GEMVs just adds compute to their
   critical path without saving any launches.
 
-The remaining genuine direction is architectural:
+The remaining genuine directions are architectural:
 
-- **More architectures** — the loader/forward is Qwen2/LLaMA-shaped; MoE
-  (Qwen2.5-MoE) or Mamba would stress the design.
+- **Partial GPU offload for MoE** — llama.cpp's `-ngl` equivalent: keep ~13 of
+  24 layers on the GPU, stream the rest from RAM. The 14B weights can't all fit
+  in VRAM, so it stays memory-bound, but it's the missing "real engine" feature.
+- **Mamba (SSM)** — the remaining stress test for the loader/forward; a
+  non-attention architecture would validate the abstraction.
 
 ## Honest limits
 
 - fp32 decode compute (the quantized GEMVs + attention accumulate in fp32, no
   tensor cores); prefill is fp16.
 - Decode throughput is a CUDA-graph capture; prefill is still eager.
-- Single architecture (Qwen2/LLaMA-style) — not a general GGUF runner.
-- No chat template yet; raw completion prompts only.
+- Two architectures (Qwen2 dense + Qwen2-MoE) — not a general GGUF runner.
+- MoE runs on CPU (RAM) at ~0.87 tok/s — correctness-first, no GPU offload yet.
+- No auto-applied chat template; the caller supplies the template string (the
+  tokenizer does handle `<|im_start|>`/`<|im_end|>` correctly).
