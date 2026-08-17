@@ -294,9 +294,10 @@ post-CUDA-graph path, where decode is no longer launch-bound):
 
 The remaining genuine directions are architectural:
 
-- **Mamba-2 decode** — the prefill uses the state-passing scan (parallel, up to
-  29× over sequential), but single-token decode is still a sequential step; a
-  fused one-token state-passing kernel is the natural follow-on.
+- **Fused Mamba-2 decode kernel** — single-token decode is now cached-state
+  (verified vs full prefill), but it's a sequential per-token step of small
+  matmuls; fusing the conv/SSM/output step into one Triton launch would cut the
+  launch-bound decode time (the 50k-vocab output projection dominates, though).
 
 ## Honest limits
 
