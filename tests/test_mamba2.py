@@ -35,7 +35,7 @@ def test_state_passing_matches_sequential(L, chunk_size):
     C = torch.randn(L, N, device="cuda")
     D = torch.rand(H, device="cuda")
     y_seq = _ssd_seq(x, dt, A, B, C, D)
-    y_sp = ssd_state_passing(x, dt, A, B, C, D, chunk_size=chunk_size)
+    y_sp = ssd_state_passing(x, dt, A, B, C, D, chunk_size=chunk_size)[0]
     assert (y_seq - y_sp).abs().max().item() < 1e-2
 
 
@@ -51,7 +51,7 @@ def test_state_passing_handles_fast_decay_heads():
     B = torch.randn(L, N, device="cuda")
     C = torch.randn(L, N, device="cuda")
     D = torch.rand(H, device="cuda")
-    y_sp = ssd_state_passing(x, dt, A, B, C, D, chunk_size=32)
+    y_sp = ssd_state_passing(x, dt, A, B, C, D, chunk_size=32)[0]
     assert torch.isfinite(y_sp).all()
     y_seq = _ssd_seq(x, dt, A, B, C, D)
     # relative tolerance: extreme dt/A blow up the magnitude (~1e3), so absolute 1e-2 is too tight
@@ -134,3 +134,10 @@ def test_mamba2_model_prefill_smoke():
     # sane distribution: the top token should not collapse to probability 1
     probs = torch.softmax(logits[-1], dim=-1)
     assert probs.max().item() < 0.99
+    # cached-state decode must match a full prefill of the extended sequence
+    tok0 = int(logits[-1].argmax())
+    m2 = Mamba2Model(path, device="cuda")
+    full = torch.cat([ids, torch.tensor([tok0], device="cuda")])
+    full_logits = m2.prefill(full)
+    step_logits = m.decode_step(tok0)
+    assert (full_logits[-1] - step_logits).abs().max().item() < 1e-2

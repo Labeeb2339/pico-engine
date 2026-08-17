@@ -70,7 +70,7 @@ def ssd_state_passing(x, dt, A, B, C, D, chunk_size=256):
         # B̄ = dt·B in the state update too
         B_w = B[s:e][:, None, :] * decay_j[..., None] * dt[s:e][:, :, None]  # (cl, H, N)
         h = decay_end[:, None, None] * h + torch.einsum("lhn,lhp->hnp", B_w, x[s:e])
-    return y
+    return y, h                                              # (L,H,P), (H,N,P) final state
 
 
 class Mamba2Model:
@@ -96,14 +96,14 @@ class Mamba2Model:
                    for i in range(self.cfg["n_layer"])]
         # per-layer recurrent state
         C0 = self.cfg["d_inner"] + 2 * self.cfg["d_state"]   # conv channels (x + B + C)
-        self.conv_states = [torch.zeros(C0, self.cfg["d_conv"] - 1, device=device)
+        self.conv_states = [torch.zeros(C0, self.cfg["d_conv"], device=device)
                             for _ in range(self.cfg["n_layer"])]
         self.ssm_states = [torch.zeros(self.cfg["nheads"], self.cfg["d_state"],
                                        self.cfg["headdim"], device=device)
                            for _ in range(self.cfg["n_layer"])]
 
     def _mixer(self, h, i):
-        """Mamba-2 mixer for a full sequence. h:(L,d_model) -> (L,d_model)."""
+        """Mamba-2 mixer for a full sequence. Returns (out, conv_state, ssm_state)."""
         c = self.cfg
         W = self.w
         p = f"backbone.layers.{i}.mixer"
@@ -114,25 +114,67 @@ class Mamba2Model:
         D = W[f"{p}.D"]
         norm_w = W[f"{p}.norm.weight"]
         out_proj = W[f"{p}.out_proj.weight"]
-        zxbcdt = h @ in_proj.T                               # (L, 3352)
+        zxbcdt = h @ in_proj.T                               # (L, d_in_proj)
         z = zxbcdt[:, :c["d_inner"]]
         x = zxbcdt[:, c["d_inner"]:2 * c["d_inner"]]
         B = zxbcdt[:, 2 * c["d_inner"]:2 * c["d_inner"] + c["d_state"]]
         C = zxbcdt[:, 2 * c["d_inner"] + c["d_state"]:2 * c["d_inner"] + 2 * c["d_state"]]
         dt_raw = zxbcdt[:, 2 * c["d_inner"] + 2 * c["d_state"]:]
         xBC = torch.cat([x, B, C], dim=-1)                   # (L, C0)
+        # conv state = last d_conv raw inputs (left-padded if L < d_conv)
+        xBC_t = xBC.t()                                      # (C0, L)
+        if xBC.shape[0] >= c["d_conv"]:
+            conv_state = xBC_t[:, -c["d_conv"]:].contiguous()  # (C0, d_conv)
+        else:
+            conv_state = F.pad(xBC_t, (c["d_conv"] - xBC.shape[0], 0)).contiguous()
         xBC = F.silu(causal_conv1d(xBC, conv_w, conv_b, c["d_conv"]))
         x = xBC[:, :c["d_inner"]].reshape(-1, c["nheads"], c["headdim"])
         B = xBC[:, c["d_inner"]:c["d_inner"] + c["d_state"]]
         C = xBC[:, c["d_inner"] + c["d_state"]:]
         dt = F.softplus(dt_raw + dt_bias)                    # (L, nheads)
-        y = ssd_state_passing(x, dt, self._A[i], B, C, D, self.chunk_size)  # (L,H,P)
+        y, ssm_state = ssd_state_passing(x, dt, self._A[i], B, C, D, self.chunk_size)
         y = y.reshape(-1, c["d_inner"])                      # (L, d_inner)
         y = rmsnorm(y * F.silu(z), norm_w, c["eps"])         # gated norm (gate-before-norm)
-        return y @ out_proj.T                                # (L, d_model)
+        return y @ out_proj.T, conv_state, ssm_state         # (L,d_model), (C0,K-1), (H,N,P)
+
+    def _mixer_step(self, h, i):
+        """Mamba-2 mixer for a single token, using/updating the cached conv+SSM states."""
+        c = self.cfg
+        W = self.w
+        p = f"backbone.layers.{i}.mixer"
+        in_proj = W[f"{p}.in_proj.weight"]
+        conv_w = W[f"{p}.conv1d.weight"].squeeze(1)
+        conv_b = W[f"{p}.conv1d.bias"]
+        dt_bias = W[f"{p}.dt_bias"]
+        D = W[f"{p}.D"]
+        norm_w = W[f"{p}.norm.weight"]
+        out_proj = W[f"{p}.out_proj.weight"]
+        zxbcdt = h @ in_proj.T                               # (d_in_proj,)
+        z = zxbcdt[:c["d_inner"]]
+        x = zxbcdt[c["d_inner"]:2 * c["d_inner"]]
+        B = zxbcdt[2 * c["d_inner"]:2 * c["d_inner"] + c["d_state"]]
+        C = zxbcdt[2 * c["d_inner"] + c["d_state"]:2 * c["d_inner"] + 2 * c["d_state"]]
+        dt_raw = zxbcdt[2 * c["d_inner"] + 2 * c["d_state"]:]
+        xBC = torch.cat([x, B, C])                           # (C0,)
+        # conv step: shift the ring buffer, write the new input, convolve
+        cs = torch.roll(self.conv_states[i], -1, dims=-1)
+        cs[:, -1] = xBC
+        self.conv_states[i] = cs
+        xBC = F.silu((cs * conv_w).sum(-1) + conv_b)         # (C0,)
+        x = xBC[:c["d_inner"]].reshape(c["nheads"], c["headdim"])
+        B = xBC[c["d_inner"]:c["d_inner"] + c["d_state"]]
+        C = xBC[c["d_inner"] + c["d_state"]:]
+        dt = F.softplus(dt_raw + dt_bias)                    # (nheads,)
+        a = torch.exp(dt * self._A[i])                       # (nheads,)
+        ss = self.ssm_states[i]                              # (H, N, P)
+        ss = a[:, None, None] * ss + dt[:, None, None] * B[None, :, None] * x[:, None, :]
+        self.ssm_states[i] = ss
+        y = (ss * C[None, :, None]).sum(dim=1) + D[:, None] * x  # (H, P)
+        y = rmsnorm(y.reshape(c["d_inner"]) * F.silu(z), norm_w, c["eps"])
+        return y @ out_proj.T                                # (d_model,)
 
     def prefill(self, ids):
-        """Full-sequence forward (parallel state-passing), returns logits + updates states."""
+        """Full-sequence forward (state-passing), returns logits + caches the states."""
         c = self.cfg
         x = self.w["backbone.embedding.weight"][ids]         # (L, d_model)
         residual = None
@@ -141,17 +183,31 @@ class Mamba2Model:
                 x = x + residual
             residual = x
             h = rmsnorm(x, self.w[f"backbone.layers.{i}.norm.weight"], c["eps"])
-            x = self._mixer(h, i)
+            x, self.conv_states[i], self.ssm_states[i] = self._mixer(h, i)
+        h_final = rmsnorm(x + residual, self.w["backbone.norm_f.weight"], c["eps"])
+        return h_final @ self.w["backbone.embedding.weight"].T
+
+    def decode_step(self, token):
+        """Single-token forward using the cached conv/SSM states. Returns (vocab,) logits."""
+        c = self.cfg
+        x = self.w["backbone.embedding.weight"][token]       # (d_model,)
+        residual = None
+        for i in range(c["n_layer"]):
+            if residual is not None:
+                x = x + residual
+            residual = x
+            h = rmsnorm(x, self.w[f"backbone.layers.{i}.norm.weight"], c["eps"])
+            x = self._mixer_step(h, i)
         h_final = rmsnorm(x + residual, self.w["backbone.norm_f.weight"], c["eps"])
         return h_final @ self.w["backbone.embedding.weight"].T
 
     @torch.no_grad()
     def generate(self, ids, max_new_tokens=32):
-        """Greedy: prefill, then one-token decode with cached conv/SSM states."""
+        """Greedy: prefill once, then one-token decode with cached states."""
         ids = list(ids)
         logits = self.prefill(torch.tensor(ids, device=self.device))
         for _ in range(max_new_tokens):
             tok = int(logits[-1].argmax())
             ids.append(tok)
-            logits = self.prefill(torch.tensor(ids, device=self.device))
+            logits = self.decode_step(tok)
         return ids
