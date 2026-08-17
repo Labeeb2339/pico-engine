@@ -220,6 +220,34 @@ buffers), so the dispatch keeps single-block for ≤1024 and chunked beyond.
 | single-block | 0.49 ms | 1.01 ms | **OOM** | **OOM** |
 | chunked | 1.08 ms | 2.22 ms | 4.40 ms | 16.5 ms |
 
+## Mamba-2 (SSD) — Mamba2-130M
+
+Mamba-2 reparameterizes the SSM with a **scalar-identity A** — one decay value
+per head, shared across the `d_state` state dimensions (vs Mamba-1's per-channel
+diagonal A). That turns the state into a matrix `(nheads, d_state, headdim)` and
+makes the within-chunk recurrence expressible as **matmuls** — the "structured
+state-space duality" (SSD) with linear attention.
+
+The fast path is a **state-passing** chunked scan: a quadratic (attention-like)
+term within each chunk via matmul, and a linear (state) term carried across
+chunks. `src/pico_engine/mamba2.py` loads the raw HF `pytorch_model.bin` (no
+`mamba_ssm`/`transformers`) and runs the prefill this way:
+
+| prefill tokens | sequential | state-passing | speedup |
+|---------------|-----------|---------------|---------|
+| 49 | 388 ms | 46.7 ms | 8.3× |
+| 97 | 713 ms | 46.8 ms | 15.2× |
+| 193 | 1370 ms | 47.0 ms | **29.1×** |
+
+Verified against a sequential recurrence (logits within 2e-4, argmax exact).
+Two gotchas worth recording:
+
+- **`norm_before_gate=False`** — the gate is applied *before* the RMSNorm
+  (`rmsnorm(y · silu(z))`), not after. The default, and the trained setting.
+- **Fast-decay heads make `A` huge** — some heads train `A = -exp(A_log)` to
+  values like -3.6e4, so `exp(positive diff)` overflows to `inf` and `inf × 0`
+  (the causal mask) = NaN. Mask the upper triangle *before* `exp`.
+
 ## Supported quantization
 
 | GGML type | used for | bytes/block |
@@ -258,16 +286,18 @@ post-CUDA-graph path, where decode is no longer launch-bound):
 
 The remaining genuine directions are architectural:
 
-- **Mamba2 / SSM variants** — different SSM parameterizations to stress the
-  scan abstraction further.
+- **Mamba-2 decode** — the prefill uses the state-passing scan (parallel, up to
+  29× over sequential), but single-token decode is still a sequential step; a
+  fused one-token state-passing kernel is the natural follow-on.
 
 ## Honest limits
 
 - fp32 decode compute (the quantized GEMVs + attention accumulate in fp32, no
   tensor cores); prefill is fp16.
 - Decode throughput is a CUDA-graph capture; prefill is still eager.
-- Three architectures (Qwen2 dense + Qwen2-MoE + Mamba) — not a general GGUF
-  runner (no vision/audio, no LoRA adapters).
+- Four architectures (Qwen2 dense + Qwen2-MoE + Mamba + Mamba-2) — not a general
+  GGUF runner (no vision/audio, no LoRA adapters); Mamba-2 loads the raw HF
+  `pytorch_model.bin`, not a GGUF.
 - MoE runs on CPU (RAM) at ~0.87 tok/s — correctness-first, partial GPU offload
   (~1.14 tok/s at 10 layers) but still memory-bound.
 - Mamba prefill is parallel (associative scan) but decode is still a sequential
