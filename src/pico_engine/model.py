@@ -21,7 +21,7 @@ import torch
 import torch.nn.functional as F
 
 from .kernels import rmsnorm, rope, silu_mul, decode_attn, q8_0_gemv, q5_0_gemv, q5_0_gemv_norm, q6_k_gemv, q4_k_gemv
-from .scan import selective_scan
+from .scan import selective_scan, chunked_selective_scan
 
 
 @dataclass
@@ -447,7 +447,7 @@ class Transformer:
         a = torch.exp(dt[:, :, None] * A[None])       # (L, d_inner, d_state)
         b = dt[:, :, None] * B[:, None, :] * x_act[:, :, None]
         c = C[:, None, :].expand(L, cfg.d_inner, cfg.d_state)
-        y, h_last = selective_scan(
+        y, h_last = self._scan_fn(L)(
             a.permute(1, 0, 2).contiguous(),
             b.permute(1, 0, 2).contiguous(),
             c.permute(1, 0, 2).contiguous(),
@@ -456,6 +456,11 @@ class Transformer:
         )
         ssm_state.copy_(h_last)
         return y.t()                                  # (L, d_inner)
+
+    @staticmethod
+    def _scan_fn(seq_len):
+        # single-block scan caps ~1024 tokens (shared-memory wall); chunked beyond
+        return selective_scan if seq_len <= 1024 else chunked_selective_scan
 
     def _mamba_layer_prefill(self, i, x, cache_i):
         cfg = self.cfg
