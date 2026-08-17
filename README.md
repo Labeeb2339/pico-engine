@@ -199,6 +199,27 @@ Verified against the sequential path (logits within 5e-5, argmax and the
 carry-over conv/SSM states exact). The kernel fuses the scan, the C·h output
 projection, the D skip, and the final-state carry-over into one launch.
 
+### Chunked scan (arbitrary length)
+
+A single associative scan needs the whole sequence resident in one block, and
+that hits the shared-memory wall at ~1024 tokens (seq 2048 → 128 KB > the 99 KB
+block limit). For longer prompts the prefill dispatches to a **two-level Blelloch
+scan** — the production Mamba2-style structure:
+
+1. scan within each chunk → local prefix product `A_t` / state `B_t` + the chunk aggregate
+2. scan the chunk aggregates → the incoming-state carry into each chunk
+3. propagate `h_t = A_t·h_in + B_t`, then `y = Cᵀh + D·x`
+
+Verified bit-exact against the single-block scan where both fit, and against the
+sequential reference up to 8192 tokens (maxdiff ~3e-6). It is ~2.2× slower than
+the single-block scan for short sequences (three kernels plus intermediate
+buffers), so the dispatch keeps single-block for ≤1024 and chunked beyond.
+
+| scan (1536 ch, d_state 16) | 512 tok | 1024 tok | 2048 tok | 8192 tok |
+|---------------------------|--------:|---------:|---------:|---------:|
+| single-block | 0.49 ms | 1.01 ms | **OOM** | **OOM** |
+| chunked | 1.08 ms | 2.22 ms | 4.40 ms | 16.5 ms |
+
 ## Supported quantization
 
 | GGML type | used for | bytes/block |
@@ -237,9 +258,6 @@ post-CUDA-graph path, where decode is no longer launch-bound):
 
 The remaining genuine directions are architectural:
 
-- **Chunked scan for long sequences** — the current scan handles a full sequence
-  in one block (fine up to ~1024 tokens); a two-pass carry-propagation would
-  remove the block-size cap and let very long prompts scan in bounded memory.
 - **Mamba2 / SSM variants** — different SSM parameterizations to stress the
   scan abstraction further.
 
@@ -253,4 +271,4 @@ The remaining genuine directions are architectural:
 - MoE runs on CPU (RAM) at ~0.87 tok/s — correctness-first, partial GPU offload
   (~1.14 tok/s at 10 layers) but still memory-bound.
 - Mamba prefill is parallel (associative scan) but decode is still a sequential
-  single-token step; the scan handles ~1024 tokens per block (no chunking yet).
+  single-token step; the scan splits into chunks for >1024-token prompts.
