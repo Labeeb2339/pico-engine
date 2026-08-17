@@ -55,7 +55,8 @@ def ssd_state_passing(x, dt, A, B, C, D, chunk_size=256):
         # so exp(positive diff) = inf and inf*0 (mask) = NaN otherwise
         dA_diff = dA_diff.masked_fill(~tril[:cl, :cl, None], float("-inf"))
         M = torch.exp(dA_diff)                              # (cl, cl, H), causal
-        W = M * CB[:, :, None]                              # (cl, cl, H)
+        # dt_j scales the B_j term (B̄ = dt·B in the discretization)
+        W = M * CB[:, :, None] * dt[s:e][None, :, :]        # (cl, cl, H)
         Y_quad = torch.einsum("ijh,jhp->ihp", W, x[s:e])    # (cl, H, P)
         # linear: Y_linear = decay_in * (C . h_prev)
         decay_in = torch.exp(dA_ch - dA_in[None, :])        # (cl, H)
@@ -66,7 +67,8 @@ def ssd_state_passing(x, dt, A, B, C, D, chunk_size=256):
         dA_end = dA_cs[e - 1]                               # (H,)
         decay_end = torch.exp(dA_end - dA_in)               # (H,)
         decay_j = torch.exp(dA_end[None, :] - dA_ch)        # (cl, H)
-        B_w = B[s:e][:, None, :] * decay_j[..., None]       # (cl, H, N)
+        # B̄ = dt·B in the state update too
+        B_w = B[s:e][:, None, :] * decay_j[..., None] * dt[s:e][:, :, None]  # (cl, H, N)
         h = decay_end[:, None, None] * h + torch.einsum("lhn,lhp->hnp", B_w, x[s:e])
     return y
 
@@ -74,9 +76,18 @@ def ssd_state_passing(x, dt, A, B, C, D, chunk_size=256):
 class Mamba2Model:
     def __init__(self, path, device="cuda", chunk_size=256):
         sd = torch.load(path, map_location="cpu", weights_only=False)
+        emb = sd["backbone.embedding.weight"]
+        p0 = "backbone.layers.0.mixer"
+        d_model = emb.shape[1]
+        n_layer = max(int(k.split(".")[2]) for k in sd
+                      if k.startswith("backbone.layers.") and k.endswith(".norm.weight")) + 1
+        d_inner = sd[f"{p0}.norm.weight"].shape[0]
+        nheads = sd[f"{p0}.dt_bias"].shape[0]
+        d_state = (sd[f"{p0}.conv1d.weight"].shape[0] - d_inner) // 2  # conv_dim = d_inner + 2*d_state
         self.cfg = dict(
-            d_model=768, n_layer=24, d_inner=1536, d_state=128,
-            nheads=24, headdim=64, ngroups=1, d_conv=4, vocab=50288, eps=1e-5,
+            d_model=d_model, n_layer=n_layer, d_inner=d_inner, d_state=d_state,
+            nheads=nheads, headdim=d_inner // nheads, ngroups=1,
+            d_conv=sd[f"{p0}.conv1d.weight"].shape[2], vocab=emb.shape[0], eps=1e-5,
         )
         self.device = device
         self.chunk_size = chunk_size
