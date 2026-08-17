@@ -239,9 +239,17 @@ chunks. `src/pico_engine/mamba2.py` loads the raw HF `pytorch_model.bin` (no
 | 97 | 713 ms | 46.8 ms | 15.2× |
 | 193 | 1370 ms | 47.0 ms | **29.1×** |
 
-Verified against a sequential recurrence (logits within 2e-4, argmax exact).
-Two gotchas worth recording:
+Verified against the mamba_ssm `chunk_state_ref` + `state_passing_ref` formulas
+(an independent implementation), and against a sequential recurrence (logits
+within 2e-4, argmax exact). Runs both 130M and 370M (config auto-detected from
+tensor shapes); 370M prefill ~2.8k tok/s, ~10× over sequential at L=53.
 
+Three gotchas worth recording:
+
+- **`B̄ = dt·B` — the discretization.** The state update is `h = a·h + (dt·B)·x`
+  and the quadratic term carries `dt_j`. Dropping the `dt` scaling produces
+  *coherent-but-wrong* output, and a sequential reference with the *same* bug
+  can't catch it — this was only found by the independent mamba_ssm check.
 - **`norm_before_gate=False`** — the gate is applied *before* the RMSNorm
   (`rmsnorm(y · silu(z))`), not after. The default, and the trained setting.
 - **Fast-decay heads make `A` huge** — some heads train `A = -exp(A_log)` to
