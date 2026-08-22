@@ -324,8 +324,9 @@ uv pip install --python .venv\Scripts\python.exe -e ".[benchmark]"
 For an engineer-reviewable result, first commit the exact source being tested,
 then run the repeated evidence command from a clean worktree. It records the
 commit/tree, model SHA-256, GPU/software stack, every sample, median, p10 and
-p90. The optional profiler directory contains Chrome traces and operator tables
-for eager and CUDA-graph decode.
+p90. The optional profiler directory contains CPU-dispatch Chrome traces and
+operator tables for eager and CUDA-graph decode. It does not claim CUPTI
+GPU-kernel timings.
 
 ```powershell
 New-Item -ItemType Directory -Force evidence\local | Out-Null

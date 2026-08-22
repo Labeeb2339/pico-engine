@@ -178,23 +178,24 @@ def _profile_mode(
     if trace_path.exists() or table_path.exists():
         raise FileExistsError(f"profile output already exists for {mode}")
     with torch.profiler.profile(
-        activities=[
-            torch.profiler.ProfilerActivity.CPU,
-            torch.profiler.ProfilerActivity.CUDA,
-        ],
+        # CUPTI GPU profiling is not reliably available on the verified
+        # Windows laptop.  This trace intentionally measures CPU dispatch,
+        # which is the overhead CUDA-graph replay is designed to collapse.
+        activities=[torch.profiler.ProfilerActivity.CPU],
         record_shapes=True,
     ) as profile:
         _run_once(engine, prompt_ids, n_tokens, use_graph=use_graph)
     profile.export_chrome_trace(os.fspath(trace_path))
     table_path.write_text(
         profile.key_averages().table(
-            sort_by="self_cuda_time_total",
+            sort_by="self_cpu_time_total",
             row_limit=40,
         ),
         encoding="utf-8",
         newline="\n",
     )
     return {
+        "scope": "cpu_dispatch_only",
         "trace": trace_path.name,
         "operator_table": table_path.name,
     }
@@ -266,23 +267,27 @@ def main() -> None:
             repetitions=args.repetitions,
         ),
     ]
-    profiles: dict[str, dict[str, str]] | None = None
+    profiles: dict[str, Any] | None = None
     if args.profile_dir is not None:
         profiles = {
-            "eager": _profile_mode(
-                engine,
-                prompt_ids,
-                min(args.n_tokens, 16),
-                use_graph=False,
-                output_dir=args.profile_dir,
-            ),
-            "cuda_graph": _profile_mode(
-                engine,
-                prompt_ids,
-                min(args.n_tokens, 16),
-                use_graph=True,
-                output_dir=args.profile_dir,
-            ),
+            "scope": "cpu_dispatch_only",
+            "note": "No CUPTI GPU-kernel timing is claimed by these profiles.",
+            "modes": {
+                "eager": _profile_mode(
+                    engine,
+                    prompt_ids,
+                    min(args.n_tokens, 16),
+                    use_graph=False,
+                    output_dir=args.profile_dir,
+                ),
+                "cuda_graph": _profile_mode(
+                    engine,
+                    prompt_ids,
+                    min(args.n_tokens, 16),
+                    use_graph=True,
+                    output_dir=args.profile_dir,
+                ),
+            },
         }
 
     model_hash = _sha256(args.model)
