@@ -43,6 +43,33 @@ and runs the same forward pass, all written by hand.
 - **Output is coherent and correct** — factual prompts, instruction prompts,
   and creative prompts all produce sensible text (see `tests/test_integration.py`).
 
+## Current reproducible evidence
+
+The checked-in receipt was captured on 2026-08-22 from clean source commit
+[`cd35095`](https://github.com/Labeeb2339/pico-engine/commit/cd350954cf5ce6e3d317f29d00982835a9f6b6a1)
+with the Qwen2.5-0.5B-Instruct Q4_K_M model whose SHA-256 begins `74a4da8c`.
+It uses greedy decoding, two warmups, ten measured repetitions, a fixed
+13-token prompt, and 64 requested decode tokens per sample on the RTX 5070
+Laptop GPU:
+
+| mode | median decode tok/s | p10 | p90 |
+|------|---------------------|-----|-----|
+| eager | 120.61 | 114.83 | 127.80 |
+| CUDA graph | **160.13** | 159.20 | 160.50 |
+
+For this protocol, CUDA-graph replay is **1.33×** the eager median. This is a
+same-engine ablation, not a llama.cpp comparison and not a cross-machine
+performance claim. The prompt is deliberately short for a reliable local
+showcase, so the recorded prefill rates are provenance data rather than a
+long-context throughput result.
+
+- [Machine-readable receipt](evidence/local/benchmark-receipt.json)
+- [Eager CPU-dispatch operator table](evidence/local/profiles/eager-decode-operators.txt)
+- [CUDA-graph CPU-dispatch operator table](evidence/local/profiles/cuda_graph-decode-operators.txt)
+
+The accompanying Chrome traces record CPU dispatch only; the receipt explicitly
+states that no CUPTI GPU-kernel timing is claimed.
+
 ## Historical benchmark record (pre-receipt)
 
 The table below is retained as a development record from earlier point

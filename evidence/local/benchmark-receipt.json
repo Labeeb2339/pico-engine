@@ -1,0 +1,253 @@
+{
+  "artifact_kind": "pico_engine_benchmark_receipt",
+  "benchmark": {
+    "greedy": true,
+    "modes": [
+      {
+        "decode_tokens_per_second": {
+          "count": 10,
+          "maximum": 128.1317194075097,
+          "median": 120.60652565730632,
+          "minimum": 109.9956861066538,
+          "p10": 114.8331925338541,
+          "p90": 127.80278694116492
+        },
+        "mode": "eager",
+        "prefill_tokens_per_second": {
+          "count": 10,
+          "maximum": 820.7796143453835,
+          "median": 770.4410607474381,
+          "minimum": 605.3522451494341,
+          "p10": 671.549142053269,
+          "p90": 804.206574407908
+        },
+        "samples": [
+          {
+            "decode_seconds": 0.5818410000001677,
+            "decode_tokens": 64,
+            "decode_tokens_per_second": 109.9956861066538,
+            "prefill_seconds": 0.015838600000279257,
+            "prefill_tokens": 13,
+            "prefill_tokens_per_second": 820.7796143453835
+          },
+          {
+            "decode_seconds": 0.5432991000002403,
+            "decode_tokens": 64,
+            "decode_tokens_per_second": 117.79883309206971,
+            "prefill_seconds": 0.02147510000031616,
+            "prefill_tokens": 13,
+            "prefill_tokens_per_second": 605.3522451494341
+          },
+          {
+            "decode_seconds": 0.5009147999999186,
+            "decode_tokens": 64,
+            "decode_tokens_per_second": 127.76623888934884,
+            "prefill_seconds": 0.016815800000131276,
+            "prefill_tokens": 13,
+            "prefill_tokens_per_second": 773.0824581583103
+          },
+          {
+            "decode_seconds": 0.5323929999999564,
+            "decode_tokens": 64,
+            "decode_tokens_per_second": 120.2119486920475,
+            "prefill_seconds": 0.016202099999645725,
+            "prefill_tokens": 13,
+            "prefill_tokens_per_second": 802.3651255259663
+          },
+          {
+            "decode_seconds": 0.5192235999998047,
+            "decode_tokens": 64,
+            "decode_tokens_per_second": 123.26096117361396,
+            "prefill_seconds": 0.019148500000028434,
+            "prefill_tokens": 13,
+            "prefill_tokens_per_second": 678.9043528203617
+          },
+          {
+            "decode_seconds": 0.5547336000004179,
+            "decode_tokens": 64,
+            "decode_tokens_per_second": 115.37069324798748,
+            "prefill_seconds": 0.017060700000001816,
+            "prefill_tokens": 13,
+            "prefill_tokens_per_second": 761.9851471509736
+          },
+          {
+            "decode_seconds": 0.5191106999996009,
+            "decode_tokens": 64,
+            "decode_tokens_per_second": 123.28776887097338,
+            "prefill_seconds": 0.017351099999814323,
+            "prefill_tokens": 13,
+            "prefill_tokens_per_second": 749.2320371699267
+          },
+          {
+            "decode_seconds": 0.5517289999997956,
+            "decode_tokens": 64,
+            "decode_tokens_per_second": 115.99897775905147,
+            "prefill_seconds": 0.016696799999863288,
+            "prefill_tokens": 13,
+            "prefill_tokens_per_second": 778.5923051187319
+          },
+          {
+            "decode_seconds": 0.5289207999999235,
+            "decode_tokens": 64,
+            "decode_tokens_per_second": 121.00110262256516,
+            "prefill_seconds": 0.01673849999997401,
+            "prefill_tokens": 13,
+            "prefill_tokens_per_second": 776.6526271780737
+          },
+          {
+            "decode_seconds": 0.49948600000016086,
+            "decode_tokens": 64,
+            "decode_tokens_per_second": 128.1317194075097,
+            "prefill_seconds": 0.01693150000028254,
+            "prefill_tokens": 13,
+            "prefill_tokens_per_second": 767.7996633365659
+          }
+        ],
+        "warmups": 2
+      },
+      {
+        "decode_tokens_per_second": {
+          "count": 10,
+          "maximum": 160.72196305809794,
+          "median": 160.13333798139826,
+          "minimum": 158.52025306762394,
+          "p10": 159.1957261723522,
+          "p90": 160.50234539741754
+        },
+        "mode": "cuda_graph",
+        "prefill_tokens_per_second": {
+          "count": 10,
+          "maximum": 759.9894770656421,
+          "median": 701.4544851869534,
+          "minimum": 584.0964028709578,
+          "p10": 643.5500739833777,
+          "p90": 746.3938503993061
+        },
+        "samples": [
+          {
+            "decode_seconds": 0.40373390000013387,
+            "decode_tokens": 64,
+            "decode_tokens_per_second": 158.52025306762394,
+            "prefill_seconds": 0.02225659999976415,
+            "prefill_tokens": 13,
+            "prefill_tokens_per_second": 584.0964028709578
+          },
+          {
+            "decode_seconds": 0.40183139999999185,
+            "decode_tokens": 64,
+            "decode_tokens_per_second": 159.27077873954426,
+            "prefill_seconds": 0.019995200000266777,
+            "prefill_tokens": 13,
+            "prefill_tokens_per_second": 650.1560374403133
+          },
+          {
+            "decode_seconds": 0.40160670000022947,
+            "decode_tokens": 64,
+            "decode_tokens_per_second": 159.35989115710328,
+            "prefill_seconds": 0.017691300000024057,
+            "prefill_tokens": 13,
+            "prefill_tokens_per_second": 734.8244617400825
+          },
+          {
+            "decode_seconds": 0.39901719999988927,
+            "decode_tokens": 64,
+            "decode_tokens_per_second": 160.3940882749359,
+            "prefill_seconds": 0.01900999999998021,
+            "prefill_tokens": 13,
+            "prefill_tokens_per_second": 683.8506049454778
+          },
+          {
+            "decode_seconds": 0.39820319999989806,
+            "decode_tokens": 64,
+            "decode_tokens_per_second": 160.72196305809794,
+            "prefill_seconds": 0.019675500000175816,
+            "prefill_tokens": 13,
+            "prefill_tokens_per_second": 660.7201849957478
+          },
+          {
+            "decode_seconds": 0.3990192000001116,
+            "decode_tokens": 64,
+            "decode_tokens_per_second": 160.39328433314012,
+            "prefill_seconds": 0.019903400000202964,
+            "prefill_tokens": 13,
+            "prefill_tokens_per_second": 653.1547373748924
+          },
+          {
+            "decode_seconds": 0.3988086999997904,
+            "decode_tokens": 64,
+            "decode_tokens_per_second": 160.47794343511973,
+            "prefill_seconds": 0.018079199999647244,
+            "prefill_tokens": 13,
+            "prefill_tokens_per_second": 719.0583654284289
+          },
+          {
+            "decode_seconds": 0.40043240000022706,
+            "decode_tokens": 64,
+            "decode_tokens_per_second": 159.8272267677733,
+            "prefill_seconds": 0.017105500000070606,
+            "prefill_tokens": 13,
+            "prefill_tokens_per_second": 759.9894770656421
+          },
+          {
+            "decode_seconds": 0.4001437000001715,
+            "decode_tokens": 64,
+            "decode_tokens_per_second": 159.9425406422057,
+            "prefill_seconds": 0.017452400000365742,
+            "prefill_tokens": 13,
+            "prefill_tokens_per_second": 744.8832252141576
+          },
+          {
+            "decode_seconds": 0.39919129999998404,
+            "decode_tokens": 64,
+            "decode_tokens_per_second": 160.3241353205908,
+            "prefill_seconds": 0.017882600000120874,
+            "prefill_tokens": 13,
+            "prefill_tokens_per_second": 726.9636406289985
+          }
+        ],
+        "warmups": 2
+      }
+    ],
+    "prompt_sha256": "9e2fbde45ff5d8907d34685cc65ef8ac0b3006d1c461bee08b5e78ec7a485daa",
+    "prompt_token_count": 13,
+    "requested_decode_tokens": 64
+  },
+  "captured_at_utc": "2026-08-22T15:27:40.497130+00:00",
+  "environment": {
+    "cuda_runtime": "12.8",
+    "gpu": "NVIDIA GeForce RTX 5070 Laptop GPU",
+    "gpu_memory_bytes": 8546484224,
+    "nvidia_driver": "592.15",
+    "platform": "Windows-10-10.0.26200-SP0",
+    "python": "3.11.15",
+    "pytorch": "2.11.0+cu128",
+    "triton": "3.7.1"
+  },
+  "model": {
+    "filename": "qwen2.5-0.5b-instruct-q4_k_m.gguf",
+    "sha256": "74a4da8c9fdbcd15bd1f6d01d621410d31c6fc00986f5eb687824e7b93d7a9db",
+    "size_bytes": 491400032
+  },
+  "profiles": {
+    "modes": {
+      "cuda_graph": {
+        "operator_table": "cuda_graph-decode-operators.txt",
+        "scope": "cpu_dispatch_only",
+        "trace": "cuda_graph-decode-trace.json"
+      },
+      "eager": {
+        "operator_table": "eager-decode-operators.txt",
+        "scope": "cpu_dispatch_only",
+        "trace": "eager-decode-trace.json"
+      }
+    },
+    "note": "No CUPTI GPU-kernel timing is claimed by these profiles.",
+    "scope": "cpu_dispatch_only"
+  },
+  "schema_version": 1,
+  "source": {
+    "commit": "cd350954cf5ce6e3d317f29d00982835a9f6b6a1",
+    "tree": "4fd9eafc0885615a07fb84b1e02f0fc83cbc8922",
+    "working_tree_clean": true
+  }
+}
