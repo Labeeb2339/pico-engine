@@ -1,6 +1,8 @@
 torch>=2.4
 numpy>=1.24
 regex>=2023.0
+triton>=3.0; sys_platform != "win32"
+triton-windows>=3.0; sys_platform == "win32"
 
-# optional: only for the benchmark comparison against llama.cpp
-llama-cpp-python>=0.3
+# Optional benchmark dependency:
+#   python -m pip install -e ".[benchmark]"

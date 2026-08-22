@@ -21,6 +21,18 @@ def _ssd_seq(x, dt, A, B, C, D):
     return torch.stack(ys)
 
 
+def test_generate_stops_before_eos():
+    """The public generator must not decode or print repeated EOS tokens."""
+    from pico_engine.mamba2 import Mamba2Model
+
+    model = object.__new__(Mamba2Model)
+    model.device = "cpu"
+    model.prefill = lambda ids: torch.tensor([[0.0, 0.0, 2.0]])
+    model.decode_step = lambda token: pytest.fail("decode_step called after EOS")
+
+    assert model.generate([1], max_new_tokens=8, eos_id=2) == [1]
+
+
 @pytest.mark.parametrize("chunk_size", [32, 64, 256])
 @pytest.mark.parametrize("L", [16, 100, 333])  # 333 crosses chunk boundaries unevenly
 def test_state_passing_matches_sequential(L, chunk_size):
@@ -76,9 +88,6 @@ def test_state_passing_matches_mamba_ssm_reference():
         dt = torch.rand(L, H, device="cuda") * 0.1 + 0.001
         A = -torch.rand(H, device="cuda") * 0.9
         B = torch.randn(L, N, device="cuda")
-        C = torch.randn(L, N, device="cuda")
-        D = torch.rand(H, device="cuda")
-
         # --- mamba_ssm chunk_state_ref: states = einsum(B * decay * dt * x) ---
         B4 = B[None, :, None, :].expand(1, L, H, N)          # (1,L,H,N) ngroups=1 -> broadcast
         x4 = x[None]                                          # (1,L,H,P)
@@ -123,8 +132,8 @@ def test_mamba2_model_prefill_smoke():
     path = "models/mamba2-130m.bin"
     if not torch.cuda.is_available() or not os.path.exists(path):
         pytest.skip("cuda or checkpoint not available")
-    from pico_engine.mamba2 import Mamba2Model
     from pico_engine.engine import Engine
+    from pico_engine.mamba2 import Mamba2Model
     m = Mamba2Model(path, device="cuda")
     e = Engine("models/mamba-130m-f16.gguf", device="cpu")  # just the tokenizer
     ids = torch.tensor(e.tok.encode("The capital of France is"), device="cuda")

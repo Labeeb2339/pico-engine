@@ -84,11 +84,18 @@ class Mamba2Model:
         d_inner = sd[f"{p0}.norm.weight"].shape[0]
         nheads = sd[f"{p0}.dt_bias"].shape[0]
         d_state = (sd[f"{p0}.conv1d.weight"].shape[0] - d_inner) // 2  # conv_dim = d_inner + 2*d_state
-        self.cfg = dict(
-            d_model=d_model, n_layer=n_layer, d_inner=d_inner, d_state=d_state,
-            nheads=nheads, headdim=d_inner // nheads, ngroups=1,
-            d_conv=sd[f"{p0}.conv1d.weight"].shape[2], vocab=emb.shape[0], eps=1e-5,
-        )
+        self.cfg = {
+            "d_model": d_model,
+            "n_layer": n_layer,
+            "d_inner": d_inner,
+            "d_state": d_state,
+            "nheads": nheads,
+            "headdim": d_inner // nheads,
+            "ngroups": 1,
+            "d_conv": sd[f"{p0}.conv1d.weight"].shape[2],
+            "vocab": emb.shape[0],
+            "eps": 1e-5,
+        }
         self.device = device
         self.chunk_size = chunk_size
         self.w = {k: v.to(device, dtype=torch.float32) for k, v in sd.items()}
@@ -202,12 +209,14 @@ class Mamba2Model:
         return h_final @ self.w["backbone.embedding.weight"].T
 
     @torch.no_grad()
-    def generate(self, ids, max_new_tokens=32):
+    def generate(self, ids, max_new_tokens=32, eos_id=None):
         """Greedy: prefill once, then one-token decode with cached states."""
         ids = list(ids)
         logits = self.prefill(torch.tensor(ids, device=self.device))
         for _ in range(max_new_tokens):
             tok = int(logits[-1].argmax())
+            if eos_id is not None and tok == eos_id:
+                break
             ids.append(tok)
             logits = self.decode_step(tok)
         return ids

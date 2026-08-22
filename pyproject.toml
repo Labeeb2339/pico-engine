@@ -1,0 +1,33 @@
+[build-system]
+requires = ["setuptools>=77"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "pico-engine"
+version = "0.1.0"
+description = "A from-scratch GGUF inference engine for quantized language models"
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+    "numpy>=1.24",
+    "regex>=2023.0",
+    "torch>=2.4",
+    "triton>=3.0; sys_platform != 'win32'",
+    "triton-windows>=3.0; sys_platform == 'win32'",
+]
+
+[project.optional-dependencies]
+benchmark = ["llama-cpp-python>=0.3"]
+dev = ["pytest>=8"]
+
+[project.scripts]
+pico-engine = "pico_engine.__main__:main"
+pico-engine-benchmark = "pico_engine.benchmark:main"
+pico-engine-evidence = "pico_engine.evidence:main"
+pico-engine-mamba2 = "pico_engine.mamba2_cli:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

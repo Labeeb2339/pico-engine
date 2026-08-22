@@ -5,10 +5,12 @@ The non-contiguous RoPE case is load-bearing: during prefill, q/k come from
 layout. The wrapper forces ``.contiguous()``; this test pins that regression.
 """
 
-import torch
 import pytest
+import torch
 
-from pico_engine.kernels import rmsnorm, rope, silu_mul, decode_attn
+from pico_engine.kernels import decode_attn, rmsnorm, rope, silu_mul
+
+pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="cuda not available")
 
 
 def test_rmsnorm_matches_torch():

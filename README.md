@@ -43,18 +43,24 @@ and runs the same forward pass, all written by hand.
 - **Output is coherent and correct** — factual prompts, instruction prompts,
   and creative prompts all produce sensible text (see `tests/test_integration.py`).
 
-## Benchmark vs llama.cpp
+## Historical benchmark record (pre-receipt)
 
-Same GGUF, greedy decoding, RTX 5070 Laptop, both engines on the GPU:
+The table below is retained as a development record from earlier point
+measurements. It predates the repeated benchmark receipt added in this release,
+so it should not be presented as current, independently reproducible evidence.
+The llama.cpp number came from a CUDA build used at the time, but that exact
+binary is not part of this repository and is not currently installed locally.
+
+Same GGUF, greedy decoding, RTX 5070 Laptop, both engines reported on the GPU:
 
 | engine | prefill (277 tok) | decode tok/s |
 |--------|-------------------|--------------|
 | pico-engine | **7,950** | **149** |
 | llama.cpp (CUDA) | **28,057** | **502** |
 
-llama.cpp — a decade-mature C++ engine with fp16 tensor-core matmuls and flash
-attention — is **~3.5× faster on prefill** and **~3.4× faster on decode**. That
-is the honest gap, and it is the expected one: pico-engine's decode still
+In those point measurements, llama.cpp — a decade-mature C++ engine with fp16
+tensor-core matmuls and flash attention — was **~3.5× faster on prefill** and
+**~3.4× faster on decode**. That gap was expected: pico-engine's decode still
 accumulates in fp32 (no tensor cores) and its prefill is eager.
 
 An earlier revision of this README claimed pico-engine was ~1.4× faster than
@@ -110,8 +116,9 @@ projection, Q5_0 for gate/up, Q6_K/Q4_K for `ffn_down` — cut the weight traffi
 against wall clock showed the CPU spent about as long *launching* kernels as the
 GPU spent running them. Capturing the single-token forward into a CUDA graph and
 replaying it per step collapsed ~200 launches into one call, taking decode
-61.5 → 149.0 tok/s — past llama.cpp. (Greedy output matches llama.cpp for ~100
-tokens, then fp32-vs-fp16 numerics diverge.)
+61.5 → 149.0 tok/s — past the CPU-only comparator used during that earlier
+iteration, not the later CUDA llama.cpp reference. (Greedy output matched
+llama.cpp for ~100 tokens, then fp32-vs-fp16 numerics diverged.)
 
 ```
 $ python -m pico_engine.benchmark models/qwen2.5-0.5b-instruct-q4_k_m.gguf
@@ -272,11 +279,101 @@ Q8_0 for embeddings, Q6_K/Q4_K for `ffn_down`. All handled.)
 
 ## Install & run
 
-```bash
-pip install -r requirements.txt
-# download a model, e.g. https://huggingface.co/Qwen/Qwen2.5-0.5B-Instruct-GGUF
-python -m pico_engine <model.gguf> --prompt "Hello" --max-tokens 64
+The dense Qwen and Mamba fast paths require an NVIDIA CUDA GPU. Python 3.11 is
+the locally verified version. From PowerShell on this PC:
+
+```powershell
+uv venv --python 3.11
+# Plain PyPI installs a CPU-only Windows wheel. Install the verified CUDA 12.8 build first.
+uv pip install --python .venv\Scripts\python.exe torch==2.11.0 `
+  --index-url https://download.pytorch.org/whl/cu128
+uv pip install --python .venv\Scripts\python.exe -e ".[dev]"
+.\.venv\Scripts\python.exe -m pytest -q
 ```
+
+The model files already present under `models/` are ignored by Git. This is the
+short, deterministic meeting demo:
+
+```powershell
+.\.venv\Scripts\pico-engine.exe models\qwen2.5-0.5b-instruct-q4_k_m.gguf `
+  --prompt "Question: What is the capital of Sarawak? Answer:" `
+  --max-tokens 11 --temperature 0
+```
+
+On macOS/Linux, create a virtual environment with `python3 -m venv .venv`,
+activate it, then run `python -m pip install -e ".[dev]"`. Download a supported
+GGUF only if it is not already present, for example Qwen2.5-0.5B-Instruct from
+its official Hugging Face repository.
+
+Useful commands:
+
+```powershell
+# Show every generation option without loading a model.
+.\.venv\Scripts\pico-engine.exe --help
+
+# Run the complete local suite. Real-model tests are enabled by the environment variable.
+$env:PICO_ENGINE_MODEL = (Resolve-Path models\qwen2.5-0.5b-instruct-q4_k_m.gguf)
+.\.venv\Scripts\python.exe -m pytest -q
+
+# Install the optional llama.cpp comparison and run the benchmark.
+uv pip install --python .venv\Scripts\python.exe -e ".[benchmark]"
+.\.venv\Scripts\pico-engine-benchmark.exe models\qwen2.5-0.5b-instruct-q4_k_m.gguf `
+  --prompt "The capital of Sarawak is" --n-tokens 64
+```
+
+For an engineer-reviewable result, first commit the exact source being tested,
+then run the repeated evidence command from a clean worktree. It records the
+commit/tree, model SHA-256, GPU/software stack, every sample, median, p10 and
+p90. The optional profiler directory contains Chrome traces and operator tables
+for eager and CUDA-graph decode.
+
+```powershell
+New-Item -ItemType Directory -Force evidence\local | Out-Null
+.\.venv\Scripts\pico-engine-evidence.exe `
+  models\qwen2.5-0.5b-instruct-q4_k_m.gguf `
+  --n-tokens 64 --warmups 2 --repetitions 10 `
+  --output evidence\local\benchmark-receipt.json `
+  --profile-dir evidence\local\profiles
+```
+
+`evidence/local/` is intended for a reviewed evidence commit or release asset,
+not for copying a single headline number into the README. CUDA/llama.cpp
+comparisons must additionally record the exact llama.cpp build and confirm that
+GPU offload is active.
+
+Development was AI-assisted. The project owner audited the implementation,
+repaired correctness and packaging defects, added regression tests, and ran the
+local benchmarks. That is different from claiming the underlying Transformer,
+GGUF, Mamba, or quantization methods as original work.
+
+For a reliable live showcase, use the 0.5B Qwen model and greedy decoding
+(`--temperature 0`). The 14B MoE file is a correctness demonstration, not a
+fast live demo: it needs roughly 32 GB of system RAM and runs much more slowly.
+`--n-gpu-layers 10` enables the tested partial-offload mode for that model.
+
+Mamba-1 uses the main command. The F16 checkpoint is the locally verified demo:
+
+```powershell
+.\.venv\Scripts\pico-engine.exe models\mamba-130m-f16.gguf `
+  --prompt "The capital of France is" --max-tokens 8 --temperature 0 --no-graph
+```
+
+Mamba-2 is stored as a raw PyTorch checkpoint, so it has a separate command and
+borrows matching tokenizer metadata from the Mamba GGUF:
+
+```powershell
+.\.venv\Scripts\pico-engine-mamba2.exe models\mamba2-130m.bin `
+  --tokenizer-gguf models\mamba-130m-f16.gguf `
+  --prompt "The quick brown fox" --max-tokens 1
+```
+
+The included Mamba-2 checkpoints are small base models, not instruction-tuned
+assistants. Use this command to explain the cached state-space inference path;
+use Qwen for the polished question-answering showcase.
+
+The default `llama-cpp-python` Windows wheel may be CPU-only. Do not present its
+numbers as a CUDA-to-CUDA comparison unless `llama.cpp` was explicitly built or
+installed with CUDA support and that backend was verified at runtime.
 
 ## What I would do next
 

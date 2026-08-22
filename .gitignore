@@ -10,5 +10,8 @@ models/
 __pycache__/
 *.pyc
 .venv/
+build/
+dist/
+*.egg-info/
 smoke.py
 bench_output.txt
